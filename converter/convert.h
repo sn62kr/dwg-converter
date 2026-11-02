@@ -1672,6 +1672,7 @@ typedef struct {
   size_t n_ltypes, cap_ltypes;
   uint64_t layer0;  // handle of layer "0" (block entities on it inherit)
   double ltscale;   // header LTSCALE
+  uint32_t units;   // header INSUNITS, into UmgHeader.units (D80)
   Vec sorts;        // uint64[2]: entity handle, its SORTENTSTABLE sort handle
 } Tables;
 
@@ -1913,8 +1914,8 @@ static char *geom_serialize(const Geom *g, Tables *t, size_t *size,
                   (uint32_t)g->texts.n, (uint32_t)pool.n,
                   (uint32_t)styles.n, (uint32_t)layers.n, (uint32_t)ltypes.n,
                   (uint32_t)dashes.n, (uint32_t)g->fills.n, (uint32_t)g->fpts.n,
-                  (uint32_t)g->hlines.n, n_ord, g->ox, g->oy, g->q};
-  memcpy(&h.magic, &hv.magic, offsetof(UmgHeader, n_ord) + sizeof h.n_ord);
+                  (uint32_t)g->hlines.n, n_ord, t->units, g->ox, g->oy, g->q};
+  memcpy(&h.magic, &hv.magic, offsetof(UmgHeader, units) + sizeof h.units);
   h.ox = hv.ox, h.oy = hv.oy, h.q = hv.q;
   Vec st16[6];
   for (int a = 0; a < 6; a++) {

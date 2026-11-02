@@ -121,6 +121,7 @@ int main(int argc, char **argv) {
       handle_kept(&ctx, o);
   }
   tab.ltscale = dwg.header_vars.LTSCALE > 0 ? dwg.header_vars.LTSCALE : 1;
+  tab.units = (uint32_t)dwg.header_vars.INSUNITS;
   dwg_free(&dwg);
   blk.layer0 = tab.layer0;
   blocks_expand(&blk, &b);

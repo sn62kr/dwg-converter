@@ -27,8 +27,27 @@ typedef struct {
   uint32_t magic, n_lines, n_arcs, n_polys, n_pts, n_texts, pool_bytes;
   uint32_t n_styles, n_layers, n_ltypes, n_dashes, n_fills, n_fpts;
   uint32_t n_hlines, n_ord;
+  uint32_t units;  // header INSUNITS (D80): 0 unset, 1 inch, 4 mm, 6 m, ...
   double ox, oy, q;
 } UmgHeader;
+
+// Millimetres per drawing unit for UmgHeader.units (INSUNITS); unset or
+// unknown units count as mm, the Korean default (D80).
+static inline double umg_mm_per_unit(uint32_t u) {
+  switch (u) {
+  case 1: return 25.4;           // inch
+  case 2: return 304.8;          // foot
+  case 4: return 1;              // mm
+  case 5: return 10;             // cm
+  case 6: return 1000;           // m
+  case 7: return 1e6;            // km
+  case 9: return 0.0254;         // mil
+  case 10: return 914.4;         // yard
+  case 13: return 0.001;         // micron
+  case 14: return 100;           // dm
+  default: return 1;
+  }
+}
 
 typedef struct { int32_t x1, y1, x2, y2; } UmgLine;
 typedef struct { int32_t cx, cy, r; float a0, a1; } UmgArc;  // CCW a0 -> a1
@@ -143,6 +162,24 @@ static inline uint32_t umg_readable_rgb(uint32_t rgb) {
   r += (1 - r) * k, g += (1 - g) * k, b += (1 - b) * k;
   return (rgb & 0xff000000u) | (uint32_t)(r * 255 + 0.5) << 16 |
          (uint32_t)(g * 255 + 0.5) << 8 | (uint32_t)(b * 255 + 0.5);
+}
+
+// Colour as shown on a light background (D82, setting 흰 배경): white and
+// near-white (AutoCAD's colour 7) turn black; lines and text brighter than
+// luma UMG_MAX_LUMA_LIGHT are darkened to it so yellow and the like stay
+// visible on white. Fills keep their colour apart from white -> black.
+#define UMG_MAX_LUMA_LIGHT 0.6
+static inline uint32_t umg_display_rgb(uint32_t rgb, int light, int fill) {
+  if (!light) return fill ? rgb : umg_readable_rgb(rgb);
+  uint32_t r8 = rgb >> 16 & 255, g8 = rgb >> 8 & 255, b8 = rgb & 255;
+  if (r8 >= 0xF0 && g8 >= 0xF0 && b8 >= 0xF0) return rgb & 0xff000000u;
+  if (fill) return rgb;
+  double r = r8 / 255.0, g = g8 / 255.0, b = b8 / 255.0,
+         y = 0.299 * r + 0.587 * g + 0.114 * b;
+  if (y <= UMG_MAX_LUMA_LIGHT) return rgb;
+  double k = UMG_MAX_LUMA_LIGHT / y;
+  return (rgb & 0xff000000u) | (uint32_t)(r * k * 255 + 0.5) << 16 |
+         (uint32_t)(g * k * 255 + 0.5) << 8 | (uint32_t)(b * k * 255 + 0.5);
 }
 
 static inline int umg_arc_segs(double sweep) {
