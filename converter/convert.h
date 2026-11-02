@@ -1513,6 +1513,29 @@ static int is_self_contained(const Dwg_Object *o) {
   }
 }
 
+// Entity types we do not draw, counted by name for the app's drawing info
+// (D86): "3DSOLID", "IMAGE", ... Block contents count once per insert.
+typedef struct { const char *name; unsigned long n; } Tally;
+static Tally g_unsup[32];
+static int g_n_unsup;
+static unsigned long g_unsup_other;
+
+static void unsupported_tally(const char *name) {
+  if (!name) name = "?";
+  // Not drawn on purpose or drawn another way: block markers, attribute
+  // definitions, paper-space viewports, dimensions (their *D block),
+  // polyline vertices and sequence ends, block references.
+  static const char *skip[] = {"BLOCK", "ENDBLK", "SEQEND", "ATTDEF", "VIEWPORT",
+                               "INSERT", "MINSERT"};
+  for (size_t i = 0; i < sizeof skip / sizeof *skip; i++)
+    if (!strcmp(name, skip[i])) return;
+  if (!strncmp(name, "DIMENSION", 9) || !strncmp(name, "VERTEX", 6)) return;
+  for (int i = 0; i < g_n_unsup; i++)
+    if (!strcmp(g_unsup[i].name, name)) { g_unsup[i].n++; return; }
+  if (g_n_unsup < 32) g_unsup[g_n_unsup++] = (Tally){name, 1};
+  else g_unsup_other++;
+}
+
 static void convert_entity(Geom *g, const Dwg_Object *o) {
   Dwg_Object_Entity *e = o->tio.entity;
   g->cur = entity_style(e);
@@ -1646,6 +1669,7 @@ static void convert_entity(Geom *g, const Dwg_Object *o) {
     break;
   default:
     g->n_skipped++;
+    unsupported_tally(o->name);
   }
 }
 

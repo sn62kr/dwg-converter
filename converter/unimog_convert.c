@@ -4,6 +4,7 @@
 //   unimog-convert in.dwg out.umg
 // stdout protocol, one line each:
 //   PROGRESS <objects decoded>      every 100k objects
+//   INFO key=value ...               drawing facts for the app (D86), before DONE
 //   DONE <ms> <primitives> <texts>  on success
 // Exit codes: 0 ok, 2 usage, 3 unreadable DWG, 4 cannot write output.
 // The output is written to out.umg.tmp and renamed, so a killed process
@@ -122,6 +123,8 @@ int main(int argc, char **argv) {
   }
   tab.ltscale = dwg.header_vars.LTSCALE > 0 ? dwg.header_vars.LTSCALE : 1;
   tab.units = (uint32_t)dwg.header_vars.INSUNITS;
+  const char *ver = dwg_version_type(dwg.header.from_version);
+  Dwg_Bitcode_3BD emin = dwg.header_vars.EXTMIN, emax = dwg.header_vars.EXTMAX;
   dwg_free(&dwg);
   blk.layer0 = tab.layer0;
   blocks_expand(&blk, &b);
@@ -137,6 +140,7 @@ int main(int argc, char **argv) {
           "hatch_lines=%zu dense_hatches=%lu sort_entries=%zu xclips=%lu\n",
           g_styles.n, tab.n_layers, tab.n_ltypes, b.fills.n, b.fpts.n / 3,
           b.hlines.n, n_hatch_dense, tab.sorts.n, n_xclip);
+  size_t n_layers = tab.n_layers;
   tables_free(&tab);
   size_t zcap = ZSTD_compressBound(raw_n);
   char *z = (char *)malloc(zcap);
@@ -154,6 +158,20 @@ int main(int argc, char **argv) {
     fprintf(stderr, "cannot write %s\n", argv[2]);
     return 4;
   }
+  // Unsupported types as NAME:count; names are LibreDWG's (no spaces).
+  char skipped[1024] = "";
+  for (int i = 0; i < g_n_unsup; i++) {
+    size_t at = strlen(skipped);
+    snprintf(skipped + at, sizeof skipped - at, "%s%s:%lu", i ? "," : "",
+             g_unsup[i].name, g_unsup[i].n);
+  }
+  if (g_unsup_other) {
+    size_t at = strlen(skipped);
+    snprintf(skipped + at, sizeof skipped - at, "%sOTHER:%lu", at ? "," : "", g_unsup_other);
+  }
+  printf("INFO ver=%s units=%u ext=%.1f,%.1f,%.1f,%.1f layers=%zu skipped=%s\n",
+         ver ? ver : "?", tab.units, emin.x, emin.y, emax.x, emax.y, n_layers,
+         skipped[0] ? skipped : "-");
   printf("DONE %.0f %zu %zu\n", (now_s() - t0) * 1e3,
          b.lines.n + b.arcs.n + b.polys.n + b.fills.n + b.hlines.n, b.texts.n);
   geom_free(&b);
