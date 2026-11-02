@@ -22,7 +22,14 @@ typedef struct {
   Tables *tab;
   int origin_set;
   unsigned long n_seen;
+  unsigned long n_paper;  // entities drawn only on layouts (paper space), D87
 } Ctx;
+
+// Paper space is not drawn (D87): count what is there so the app can say
+// "this drawing lives on its layouts". Viewports are frames, not content.
+static void count_paper(Ctx *c, const Dwg_Object *o) {
+  if (o->fixedtype != DWG_TYPE_VIEWPORT) c->n_paper++;
+}
 
 // Origin = center of the header extents; q = the smallest power of two that
 // keeps +-2x the extents inside int32. Stale or missing extents fall back to
@@ -41,7 +48,8 @@ static void set_origin(Ctx *c, Dwg_Data *dwg) {
 // Self-contained entity: converted straight into model space or its block.
 static void handle_self_contained(Ctx *c, const Dwg_Object *o) {
   Dwg_Object_Entity *e = o->tio.entity;
-  if (e->entmode == 1 || (e->invisible & 1)) return;  // paper space, hidden
+  if (e->invisible & 1) return;  // hidden
+  if (e->entmode == 1) { count_paper(c, o); return; }  // active layout
   if (e->entmode == 2)
     convert_entity(c->b, o);
   else
@@ -53,6 +61,11 @@ static void handle_self_contained(Ctx *c, const Dwg_Object *o) {
 static void handle_kept(Ctx *c, const Dwg_Object *o) {
   if (o->fixedtype == DWG_TYPE_BLOCK_HEADER) {
     blocks_set_base(c->blk, o);
+    // Other layouts' contents sit in *Paper_Space0, 1, ... blocks.
+    const Dwg_Object_BLOCK_HEADER *bh = o->tio.object->tio.BLOCK_HEADER;
+    char *nm = dwg_utf8(o, bh->name);
+    if (nm && !strncasecmp(nm, "*Paper_Space", 12) && nm[12]) c->n_paper += bh->num_owned;
+    free(nm);
   } else if (o->supertype != DWG_SUPERTYPE_ENTITY) {
     tables_add(c->tab, o);
   } else if (o->tio.entity->invisible & 1) {
@@ -64,6 +77,8 @@ static void handle_kept(Ctx *c, const Dwg_Object *o) {
     blocks_add_insert(c->blk, o);
   } else if (is_dimension(o)) {  // radius, angular, ...: not streamed
     blocks_add_dimension(c->blk, o);
+  } else if (o->tio.entity->entmode == 1) {
+    count_paper(c, o);
   } else if (o->tio.entity->entmode == 2) {
     convert_entity(c->b, o);  // unsupported types are counted as skipped
   } else if (o->tio.entity->entmode == 0 && o->fixedtype != DWG_TYPE_VERTEX_2D &&
@@ -169,9 +184,11 @@ int main(int argc, char **argv) {
     size_t at = strlen(skipped);
     snprintf(skipped + at, sizeof skipped - at, "%sOTHER:%lu", at ? "," : "", g_unsup_other);
   }
-  printf("INFO ver=%s units=%u ext=%.1f,%.1f,%.1f,%.1f layers=%zu skipped=%s\n",
+  printf("INFO ver=%s units=%u ext=%.1f,%.1f,%.1f,%.1f layers=%zu paper=%lu "
+         "prims=%zu texts=%zu skipped=%s\n",
          ver ? ver : "?", tab.units, emin.x, emin.y, emax.x, emax.y, n_layers,
-         skipped[0] ? skipped : "-");
+         ctx.n_paper, b.lines.n + b.arcs.n + b.polys.n + b.fills.n + b.hlines.n,
+         b.texts.n, skipped[0] ? skipped : "-");
   printf("DONE %.0f %zu %zu\n", (now_s() - t0) * 1e3,
          b.lines.n + b.arcs.n + b.polys.n + b.fills.n + b.hlines.n, b.texts.n);
   geom_free(&b);
