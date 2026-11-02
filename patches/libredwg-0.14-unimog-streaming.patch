@@ -1,0 +1,145 @@
+--- libredwg-0.14/src/decode.c	2026-06-28 00:31:53
++++ libredwg-0.14/src/decode.c	2026-10-29 01:15:22
+@@ -2473,6 +2473,67 @@
+ 
+ /* R2004, 2010+ Handles Section
+  */
++/* UNIMOG streaming patch (GPL-3.0, same license as LibreDWG).
++   When a callback is set, each freshly decoded object is offered to it.
++   If the callback returns non-zero it has consumed the object: the object's
++   data and its global handle refs are freed, its object_map entry is
++   invalidated and its slot in dwg->object is reused. This keeps peak memory
++   bounded by the non-consumed objects instead of the whole drawing. */
++static dwg_stream_cb stream_cb = NULL;
++static void *stream_ud = NULL;
++static int stream_have_last = 0;
++static BITCODE_RLL stream_last_handle = 0;
++static BITCODE_MC stream_last_size = 0;
++static unsigned long stream_consumed = 0;
++static int stream_active = 0;  // only inside the R2004+ object stream
++static int stream_pending = 0; // callback consumed the object being added
++
++EXPORT void
++dwg_set_stream_callback (dwg_stream_cb cb, void *userdata)
++{
++  stream_cb = cb;
++  stream_ud = userdata;
++  stream_have_last = 0;
++  stream_consumed = 0;
++}
++
++EXPORT unsigned long
++dwg_stream_consumed (void)
++{
++  return stream_consumed;
++}
++
++static void
++stream_consume (Dwg_Data *restrict dwg, BITCODE_BL nobj, BITCODE_BL nrefs)
++{
++  Dwg_Object *obj;
++  BITCODE_BL i;
++  int pending = stream_pending;
++  stream_pending = 0; // never let a decision leak into the next object
++  if (dwg->num_objects != nobj + 1)
++    return; // nothing added (skipped or error)
++  obj = &dwg->object[nobj];
++  if (!pending)
++    {
++      stream_have_last = 0;
++      return;
++    }
++  stream_have_last = 1;
++  stream_last_handle = obj->handle.value;
++  stream_last_size = obj->size;
++  dwg_free_object (obj);
++  for (i = nrefs; i < dwg->num_object_refs; i++)
++    {
++      free (dwg->object_ref[i]);
++      dwg->object_ref[i] = NULL;
++    }
++  dwg->num_object_refs = nrefs;
++  // never entered into object_map, see dwg_decode_add_object
++  memset (obj, 0, sizeof (Dwg_Object));
++  dwg->num_objects--;
++  stream_consumed++;
++}
++
+ static int
+ read_2004_section_handles (Bit_Chain *restrict dat, Dwg_Data *restrict dwg)
+ {
+@@ -2545,18 +2606,25 @@
+         }
+ 
+       last_offset = 0;
++      stream_active = stream_cb != NULL;
+       while ((long)(hdl_dat.byte - startpos) < (long)section_size)
+         {
+           int added;
+           BITCODE_UMC handleoff;
+           BITCODE_MC offset;
++          // UNIMOG streaming: the last decoded object may have been consumed
++          // and popped, so remember its handle and size separately.
+           BITCODE_RLL last_handle
+-              = dwg->num_objects
++              = stream_have_last ? stream_last_handle
++                : dwg->num_objects
+                     ? dwg->object[dwg->num_objects - 1].handle.value
+                     : 0;
+           BITCODE_MC prevsize
+-              = dwg->num_objects ? dwg->object[dwg->num_objects - 1].size + 4
+-                                 : 0;
++              = stream_have_last ? stream_last_size + 4
++                : dwg->num_objects ? dwg->object[dwg->num_objects - 1].size + 4
++                                   : 0;
++          BITCODE_BL stream_nobj = dwg->num_objects;
++          BITCODE_BL stream_nrefs = dwg->num_object_refs;
+ 
+           oldpos = hdl_dat.byte;
+           // the offset from the previous handle. default: 1, unsigned
+@@ -2597,6 +2665,7 @@
+           if (added > 0)
+             error |= added;
+           // else re-allocated
++          stream_consume (dwg, stream_nobj, stream_nrefs);
+           // we don't stop encoding on single errors, but we sum them all up
+           // as combined bitmask
+         }
+@@ -2634,6 +2703,7 @@
+     }
+   while (section_size > 2);
+ 
++  stream_active = 0;
+   free (hdl_dat.chain);
+   free (obj_dat.chain);
+   return error;
+@@ -5824,7 +5894,13 @@
+         }
+     }
+ 
+-  if (obj->handle.value)
++  // UNIMOG streaming: a consumed object is freed by the caller right after
++  // this returns, so it must not enter object_map at all.
++  stream_pending = 0;
++  if (stream_active && error < DWG_ERR_CRITICAL
++      && stream_cb (dwg, obj, stream_ud))
++    stream_pending = 1;
++  else if (obj->handle.value)
+     { // empty only with UNKNOWN
+       LOG_HANDLE (" object_map{" FORMAT_HV "} = %lu\n", obj->handle.value,
+                   (unsigned long)num);
+--- libredwg-0.14/include/dwg.h	2026-06-28 00:27:54
++++ libredwg-0.14/include/dwg.h	2026-10-29 01:07:20
+@@ -11507,6 +11507,12 @@
+ /*--------------------------------------------------
+  * Exported Functions
+  */
++
++/* UNIMOG streaming patch: return non-zero from the callback to consume
++   (free) the just-decoded object. R2004+ object stream only. */
++typedef int (*dwg_stream_cb) (Dwg_Data *dwg, Dwg_Object *obj, void *userdata);
++EXPORT void dwg_set_stream_callback (dwg_stream_cb cb, void *userdata);
++EXPORT unsigned long dwg_stream_consumed (void);
+ 
+ EXPORT int dwg_read_file (const char *restrict filename,
+                           Dwg_Data *restrict dwg);
