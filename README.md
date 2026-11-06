@@ -1,10 +1,10 @@
 # DWG converter (GPL source)
 
-이 저장소는 Android 앱 `app.sn62kr.plan`(버전 0.1.19-m1)에 들어 있는 **DWG 변환 프로그램**
+이 저장소는 Android 앱 `app.sn62kr.plan`(버전 0.1.23-m1)에 들어 있는 **DWG 변환 프로그램**
 (`libunimogconv.so`)의 전체 소스입니다. GNU GPL v3 이상(COPYING)에 따라 공개합니다.
 
 This repository is the complete corresponding source of the DWG converter
-(`libunimogconv.so`) shipped in the Android app `app.sn62kr.plan` (0.1.19-m1), released
+(`libunimogconv.so`) shipped in the Android app `app.sn62kr.plan` (0.1.23-m1), released
 under the GNU GPL version 3 or later (see COPYING).
 
 ## 구성 / Contents

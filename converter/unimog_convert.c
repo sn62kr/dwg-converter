@@ -54,7 +54,7 @@ static void handle_self_contained(Ctx *c, const Dwg_Object *o) {
     convert_entity(c->b, o);
   else
     convert_entity(&block_get(c->blk, ref_handle(e->ownerhandle))->geom, o);
-  if (is_dimension(o)) blocks_add_dimension(c->blk, o);
+  if (is_dimension(o)) blocks_add_dimension(c->blk, c->b, o);
 }
 
 // Everything the streaming decoder keeps: block headers and references.
@@ -76,7 +76,7 @@ static void handle_kept(Ctx *c, const Dwg_Object *o) {
              o->fixedtype == DWG_TYPE_MINSERT) {
     blocks_add_insert(c->blk, o);
   } else if (is_dimension(o)) {  // radius, angular, ...: not streamed
-    blocks_add_dimension(c->blk, o);
+    blocks_add_dimension(c->blk, c->b, o);
   } else if (o->tio.entity->entmode == 1) {
     count_paper(c, o);
   } else if (o->tio.entity->entmode == 2) {
@@ -152,9 +152,9 @@ int main(int argc, char **argv) {
   if (overflow) fprintf(stderr, "styles over 65535: %lu\n", overflow);
   fprintf(stderr,
           "styles raw=%zu layers=%zu ltypes=%zu fills=%zu triangles=%zu "
-          "hatch_lines=%zu dense_hatches=%lu sort_entries=%zu xclips=%lu\n",
+          "hatch_lines=%zu dense_hatches=%lu sort_entries=%zu xclips=%lu dims_drawn=%lu\n",
           g_styles.n, tab.n_layers, tab.n_ltypes, b.fills.n, b.fpts.n / 3,
-          b.hlines.n, n_hatch_dense, tab.sorts.n, n_xclip);
+          b.hlines.n, n_hatch_dense, tab.sorts.n, n_xclip, g_dim_drawn);
   size_t n_layers = tab.n_layers;
   tables_free(&tab);
   size_t zcap = ZSTD_compressBound(raw_n);

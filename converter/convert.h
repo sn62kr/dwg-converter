@@ -1101,10 +1101,11 @@ static void add_point(Geom *g, const Dwg_Object *o) {
   const Dwg_Header_Variables *hv = &o->parent->header_vars;
   int mode = hv->PDMODE, shape = mode & 7;
   double s = hv->PDSIZE;
-  if (!(s > 0)) {
-    double hgt = hv->EXTMAX.y - hv->EXTMIN.y;
-    s = (s < 0 ? -s : 5) / 100 * (isfinite(hgt) && hgt > 0 ? hgt : 1);
-  }
+  // PDSIZE <= 0 sizes the symbol relative to the screen, which a static
+  // picture cannot do; scaled to the drawing extents it grew huge (public
+  // drawing: PDMODE 35, PDSIZE -10%, dimension definition points became
+  // circles and crosses many times the plan). Such points are dots.
+  if (!(s > 0)) mode = 0, shape = 0;
   double x = p->x, y = p->y, h = s / 2;
   double c = cos(p->x_ang), sn = sin(p->x_ang);
   Xf m = {c, -sn, sn, c, x, y};  // symbol axes turned by x_ang
@@ -1492,6 +1493,267 @@ static void add_multileader(Geom *g, const Dwg_Object *o) {
   } else if (x->has_content_blk) {
     g->n_skipped++;
   }
+}
+
+// ---- dimensions without a *D block ----------------------------------------
+// AutoCAD normally stores a dimension's picture in an anonymous *D block and
+// we draw that (blocks_add_dimension). Some files carry the dimension data
+// only (Autodesk's own R2010 sample drawings: 44 dimensions, no *D blocks),
+// so we draw it here from the definition points: extension lines, dimension
+// line, arrows or ticks, and the measurement text. Style values come from
+// the dimension's DIMSTYLE when it is already decoded, else from the header.
+static unsigned long g_dim_drawn;  // dimensions drawn without a *D block
+
+typedef struct {
+  double asz, txt, scale, exo, exe, gap, tsz, lfac, dle;
+  int dec, adec, lunit, zin;
+  BITCODE_H blk;
+} DimVars;
+
+#define DIMVARS_FROM(V, S)                                                    \
+  do {                                                                        \
+    V.asz = S.DIMASZ, V.txt = S.DIMTXT, V.scale = S.DIMSCALE;                 \
+    V.exo = S.DIMEXO, V.exe = S.DIMEXE, V.gap = S.DIMGAP, V.tsz = S.DIMTSZ;   \
+    V.lfac = S.DIMLFAC, V.dle = S.DIMDLE, V.dec = S.DIMDEC;                   \
+    V.adec = S.DIMADEC, V.lunit = S.DIMLUNIT, V.zin = S.DIMZIN;               \
+    V.blk = S.DIMBLK;                                                         \
+  } while (0)
+
+static DimVars dim_vars(const Dwg_Object *o, BITCODE_H style) {
+  DimVars v;
+  Dwg_Data *dwg = o->parent;
+  DIMVARS_FROM(v, dwg->header_vars);
+  Dwg_Object *ds = style ? dwg_ref_object(dwg, style) : NULL;
+  if (ds && ds->fixedtype == DWG_TYPE_DIMSTYLE && ds->tio.object &&
+      ds->tio.object->tio.DIMSTYLE) {
+    const Dwg_Object_DIMSTYLE *d = ds->tio.object->tio.DIMSTYLE;
+    DIMVARS_FROM(v, (*d));
+  }
+  if (!(v.scale > 0)) v.scale = 1;
+  if (!(v.lfac != 0)) v.lfac = 1;
+  if (!(v.txt > 0)) v.txt = 2.5;
+  if (!(v.asz >= 0)) v.asz = v.txt;
+  if (v.dec < 0 || v.dec > 8) v.dec = 0;
+  if (v.adec < 0 || v.adec > 8) v.adec = 0;
+  return v;
+}
+
+// Number as decimal with dec places; DIMZIN 8 drops trailing zeros.
+static void dim_decimal(char *out, size_t n, double v, int dec, int zin) {
+  snprintf(out, n, "%.*f", dec, v);
+  if ((zin & 8) && strchr(out, '.')) {
+    char *e = out + strlen(out) - 1;
+    while (*e == '0') *e-- = 0;
+    if (*e == '.') *e = 0;
+  }
+  if (!strcmp(out, "-0")) strcpy(out, "0");
+}
+
+// Architectural units (DIMLUNIT 4): inches as 12'-6 1/2", fraction 1/2^dec.
+static void dim_arch(char *out, size_t n, double v, int dec) {
+  int den = 1 << (dec > 0 ? dec : 0);
+  long t = lround(fabs(v) * den);  // in 1/den inch
+  long ft = t / (12L * den), rem = t % (12L * den);
+  long in = rem / den, fr = rem % den;
+  while (fr && !(fr & 1)) fr >>= 1, den >>= 1;
+  char frac[24] = "";
+  if (fr) snprintf(frac, sizeof frac, " %ld/%d", fr, den);
+  if (ft) snprintf(out, n, "%s%ld'-%ld%s\"", v < 0 ? "-" : "", ft, in, frac);
+  else snprintf(out, n, "%s%ld%s\"", v < 0 ? "-" : "", in, frac);
+}
+
+static void dim_value(char *out, size_t n, const DimVars *v, double meas,
+                      int angular) {
+  if (angular) {
+    char num[48];
+    dim_decimal(num, sizeof num, meas * 180 / M_PI, v->adec, v->zin);
+    snprintf(out, n, "%s%%%%d", num);
+  } else if (v->lunit == 4) {
+    dim_arch(out, n, meas * v->lfac, v->dec);
+  } else {
+    dim_decimal(out, n, meas * v->lfac, v->dec, v->zin);
+  }
+}
+
+// The text shown: user text with "<>" replaced by the value; "" = value
+// alone, " " = no text.
+static char *dim_text(const Dwg_Object *o, BITCODE_T user, const char *val,
+                      const char *prefix) {
+  char *u = dwg_utf8(o, user);
+  char *r;
+  if (u && !strcmp(u, " ")) {
+    r = NULL;
+  } else if (!u || !*u) {
+    size_t n = strlen(prefix) + strlen(val) + 1;
+    r = malloc(n);
+    snprintf(r, n, "%s%s", prefix, val);
+  } else {
+    char *at = strstr(u, "<>");
+    if (!at) {
+      r = strdup(u);
+    } else {
+      size_t n = strlen(u) + strlen(prefix) + strlen(val) + 1;
+      r = malloc(n);
+      snprintf(r, n, "%.*s%s%s%s", (int)(at - u), u, prefix, val, at + 2);
+    }
+  }
+  free(u);
+  return r;
+}
+
+// Reading direction: angles that would print upside down turn by 180.
+static double dim_readable(double a) {
+  a = remainder(a, 2 * M_PI);
+  if (a > M_PI / 2 + 1e-9) a -= M_PI;
+  else if (a <= -M_PI / 2 + 1e-9) a += M_PI;
+  return a;
+}
+
+// Arrow (or tick when DIMTSZ > 0) at (x, y), (ux, uy) the unit direction
+// pointing into the tip.
+static void dim_arrow(Geom *g, const Dwg_Object *o, const DimVars *v,
+                      double x, double y, double ux, double uy) {
+  double s = v->scale;
+  if (v->tsz > 0) {
+    double h = v->tsz * s, c = M_SQRT1_2;
+    double tx = (ux - uy) * c * h, ty = (uy + ux) * c * h;
+    add_line(g, XF_ID, x - tx, y - ty, x + tx, y + ty);
+  } else {
+    add_ml_arrow(g, o, v->blk, x, y, ux, uy, v->asz * s);
+  }
+}
+
+static void dim_put_text(Geom *g, const Dwg_Object *o, const char *str,
+                         double h, double rot, double x, double y) {
+  if (!str || !*str) return;
+  Vec tmp = {NULL, 0, 0, 1};
+  pool_clean(&tmp, str, 1);
+  if (tmp.n) {
+    UmgText r = {0};
+    r.h = (float)h, r.rot = (float)rot, r.wf = 1;
+    r.ha = 1, r.va = 2;  // middle center on text_midpt
+    push_text(g, r, x, y, x, y, (const char *)tmp.p, (uint32_t)tmp.n);
+  }
+  free(tmp.p);
+}
+
+// Linear / aligned: dim line through def_pt at angle `ang`.
+static void dim_linear(Geom *g, const Dwg_Object *o, const DimVars *v,
+                       const Dwg_DIMENSION_common *d, double x1, double y1,
+                       double x2, double y2, double ang, double *mx, double *my) {
+  double ux = cos(ang), uy = sin(ang), nx = -uy, ny = ux;
+  double px = d->def_pt.x, py = d->def_pt.y;
+  // Feet of the extension lines on the dimension line.
+  double t1 = (x1 - px) * ux + (y1 - py) * uy, t2 = (x2 - px) * ux + (y2 - py) * uy;
+  double a1x = px + ux * t1, a1y = py + uy * t1, a2x = px + ux * t2, a2y = py + uy * t2;
+  double s = v->scale;
+  // Extension lines: from DIMEXO off the object to DIMEXE past the dim line.
+  double xs[2] = {x1, x2}, ys[2] = {y1, y2}, ax[2] = {a1x, a2x}, ay[2] = {a1y, a2y};
+  for (int i = 0; i < 2; i++) {
+    double dx = ax[i] - xs[i], dy = ay[i] - ys[i], len = hypot(dx, dy);
+    if (len < 1e-9) continue;
+    dx /= len, dy /= len;
+    double o0 = fmin(v->exo * s, len);
+    add_line(g, XF_ID, xs[i] + dx * o0, ys[i] + dy * o0, ax[i] + dx * v->exe * s,
+             ay[i] + dy * v->exe * s);
+  }
+  *mx = (a1x + a2x) / 2, *my = (a1y + a2y) / 2;
+  double len = hypot(a2x - a1x, a2y - a1y);
+  if (len < 1e-9) return;
+  double dx = (a2x - a1x) / len, dy = (a2y - a1y) / len;
+  double ext = v->tsz > 0 ? v->dle * s : 0;
+  add_line(g, XF_ID, a1x - dx * ext, a1y - dy * ext, a2x + dx * ext, a2y + dy * ext);
+  if (len > 2 * v->asz * s || v->tsz > 0) {  // arrows inside
+    dim_arrow(g, o, v, a1x, a1y, -dx, -dy);
+    dim_arrow(g, o, v, a2x, a2y, dx, dy);
+  } else {  // too short: arrows outside, pointing in
+    dim_arrow(g, o, v, a1x, a1y, dx, dy);
+    dim_arrow(g, o, v, a2x, a2y, -dx, -dy);
+  }
+  (void)nx, (void)ny;
+}
+
+static void add_dimension(Geom *g, const Dwg_Object *o) {
+  const Dwg_DIMENSION_common *d = o->tio.entity->tio.DIMENSION_LINEAR
+                                      ? (const Dwg_DIMENSION_common *)o->tio.entity->tio.DIMENSION_LINEAR
+                                      : NULL;
+  if (!d) return;
+  DimVars v = dim_vars(o, d->dimstyle);
+  // Annotative dimensions keep paper sizes (1/8") and are scaled by the
+  // annotation scale, which lives in extension dictionaries we do not read.
+  // Keep the text at least 1/200 of the drawing so it stays readable.
+  {
+    Dwg_Bitcode_3BD lo = o->parent->header_vars.EXTMIN, hi = o->parent->header_vars.EXTMAX;
+    double span = fmax(hi.x - lo.x, hi.y - lo.y);
+    double want = isfinite(span) && span > 0 && span < 1e12 ? span / 200 : 0;
+    if (want > v.txt * v.scale) v.scale = want / v.txt;
+  }
+  double h = v.txt * v.scale, rot = 0;
+  double mx = d->text_midpt.x, my = d->text_midpt.y;  // default text spot
+  int place = d->text_midpt.x == 0 && d->text_midpt.y == 0;  // not stored
+  char val[64];
+  const char *prefix = "";
+  int angular = 0;
+  switch (o->fixedtype) {
+  case DWG_TYPE_DIMENSION_LINEAR: {
+    const Dwg_Entity_DIMENSION_LINEAR *l = o->tio.entity->tio.DIMENSION_LINEAR;
+    rot = l->dim_rotation;
+    dim_linear(g, o, &v, d, l->xline1_pt.x, l->xline1_pt.y, l->xline2_pt.x,
+               l->xline2_pt.y, rot, &mx, &my);
+  } break;
+  case DWG_TYPE_DIMENSION_ALIGNED: {
+    const Dwg_Entity_DIMENSION_ALIGNED *l = o->tio.entity->tio.DIMENSION_ALIGNED;
+    rot = atan2(l->xline2_pt.y - l->xline1_pt.y, l->xline2_pt.x - l->xline1_pt.x);
+    dim_linear(g, o, &v, d, l->xline1_pt.x, l->xline1_pt.y, l->xline2_pt.x,
+               l->xline2_pt.y, rot, &mx, &my);
+  } break;
+  case DWG_TYPE_DIMENSION_RADIUS: {
+    const Dwg_Entity_DIMENSION_RADIUS *r = o->tio.entity->tio.DIMENSION_RADIUS;
+    double cx = r->def_pt.x, cy = r->def_pt.y, ex = r->first_arc_pt.x, ey = r->first_arc_pt.y;
+    double len = hypot(ex - cx, ey - cy);
+    if (len > 1e-9) {
+      add_line(g, XF_ID, cx, cy, ex, ey);
+      dim_arrow(g, o, &v, ex, ey, (ex - cx) / len, (ey - cy) / len);
+    }
+    rot = atan2(ey - cy, ex - cx);
+    mx = (cx + ex) / 2, my = (cy + ey) / 2;
+    prefix = "R";
+  } break;
+  case DWG_TYPE_DIMENSION_DIAMETER: {
+    const Dwg_Entity_DIMENSION_DIAMETER *r = o->tio.entity->tio.DIMENSION_DIAMETER;
+    double ax = r->def_pt.x, ay = r->def_pt.y, bx = r->first_arc_pt.x, by = r->first_arc_pt.y;
+    double len = hypot(bx - ax, by - ay);
+    if (len > 1e-9) {
+      double ux = (bx - ax) / len, uy = (by - ay) / len;
+      add_line(g, XF_ID, ax, ay, bx, by);
+      dim_arrow(g, o, &v, ax, ay, -ux, -uy);
+      dim_arrow(g, o, &v, bx, by, ux, uy);
+    }
+    rot = atan2(by - ay, bx - ax);
+    mx = (ax + bx) / 2, my = (ay + by) / 2;
+    prefix = "%%c";
+  } break;
+  case DWG_TYPE_DIMENSION_ANG3PT:
+  case DWG_TYPE_DIMENSION_ANG2LN:
+    angular = 1;  // text only: the arc needs the quadrant logic
+    break;
+  default:  // ordinate: text only
+    break;
+  }
+  dim_value(val, sizeof val, &v, d->act_measurement, angular);
+  char *t = dim_text(o, d->user_text, val, prefix);
+  double trot = d->text_rotation != 0 ? d->text_rotation : dim_readable(rot);
+  if (angular || o->fixedtype == DWG_TYPE_DIMENSION_ORDINATE) trot = d->text_rotation;
+  if (place) {  // above the dimension line (DIMTAD 1 look), else as stored
+    if (angular || o->fixedtype == DWG_TYPE_DIMENSION_ORDINATE) { free(t); g_dim_drawn++; return; }
+    double off = h / 2 + v.gap * v.scale + h * 0.2;
+    mx += -sin(trot) * off, my += cos(trot) * off;
+  } else {
+    mx = d->text_midpt.x, my = d->text_midpt.y;
+  }
+  dim_put_text(g, o, t, h, trot, mx, my);
+  free(t);
+  g_dim_drawn++;
 }
 
 // ---- entities -------------------------------------------------------------

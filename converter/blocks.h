@@ -118,9 +118,20 @@ static Refs *refs_for(Blocks *s, const Dwg_Object_Entity *e) {
 
 // DIMENSION geometry lives in an anonymous *D block already in world
 // coordinates, so it is placed with the identity transform.
-static void blocks_add_dimension(Blocks *s, const Dwg_Object *o) {
+// Without a *D block the dimension is drawn from its own data instead
+// (add_dimension), into model space or its owning block.
+static void blocks_add_dimension(Blocks *s, Geom *ms, const Dwg_Object *o) {
   Refs *r = refs_for(s, o->tio.entity);
   uint64_t h = ref_handle(o->tio.entity->tio.DIMENSION_LINEAR->block);
+  if (r && !h) {
+    const Dwg_Object_Entity *e = o->tio.entity;
+    Geom *g = e->entmode == 2 ? ms : &block_get(s, ref_handle(e->ownerhandle))->geom;
+    g->cur = entity_style(e);
+    OrdKey k = {g->model ? o->handle.value : 0, g->model ? 0 : o->handle.value};
+    g->ord = k;
+    add_dimension(g, o);
+    return;
+  }
   if (r && h)
     refs_push(r, h, XF_ID, entity_style(o->tio.entity), o->handle.value),
         s->n_dim++;
