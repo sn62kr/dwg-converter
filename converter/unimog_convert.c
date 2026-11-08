@@ -119,6 +119,7 @@ int main(int argc, char **argv) {
   Tables tab = {0};
   Ctx ctx = {&b, &blk, &tab, 0, 0};
 
+  dwg_set_skip_eed(1);  // never read; some drawings carry hundreds of MB
   dwg_set_stream_callback(on_object, &ctx);
   int err = dwg_read_file(argv[1], &dwg);
   dwg_set_stream_callback(NULL, NULL);

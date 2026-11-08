@@ -1,6 +1,6 @@
---- libredwg-0.14/src/decode.c	2026-06-28 00:31:53
-+++ libredwg-0.14/src/decode.c	2026-10-29 01:15:22
-@@ -2473,6 +2473,67 @@
+--- libredwg-0.14/src/decode.c
++++ libredwg-0.14/src/decode.c
+@@ -2473,6 +2473,84 @@
  
  /* R2004, 2010+ Handles Section
   */
@@ -16,7 +16,7 @@
 +static BITCODE_RLL stream_last_handle = 0;
 +static BITCODE_MC stream_last_size = 0;
 +static unsigned long stream_consumed = 0;
-+static int stream_active = 0;  // only inside the R2004+ object stream
++static int stream_active = 0;  // only inside the R2004+/R2007 object stream
 +static int stream_pending = 0; // callback consumed the object being added
 +
 +EXPORT void
@@ -34,7 +34,24 @@
 +  return stream_consumed;
 +}
 +
-+static void
++/* R2007 has its own handles loop in decode_r2007.c: it brackets that loop
++   with stream_r2007_begin/end and calls stream_consume after each object. */
++void
++stream_r2007_begin (void)
++{
++  stream_active = stream_cb != NULL;
++  stream_have_last = 0;
++  stream_pending = 0;
++}
++
++void
++stream_r2007_end (void)
++{
++  stream_active = 0;
++  stream_pending = 0;
++}
++
++void
 +stream_consume (Dwg_Data *restrict dwg, BITCODE_BL nobj, BITCODE_BL nrefs)
 +{
 +  Dwg_Object *obj;
@@ -68,7 +85,7 @@
  static int
  read_2004_section_handles (Bit_Chain *restrict dat, Dwg_Data *restrict dwg)
  {
-@@ -2545,18 +2606,25 @@
+@@ -2545,18 +2623,25 @@
          }
  
        last_offset = 0;
@@ -97,7 +114,7 @@
  
            oldpos = hdl_dat.byte;
            // the offset from the previous handle. default: 1, unsigned
-@@ -2597,6 +2665,7 @@
+@@ -2597,6 +2682,7 @@
            if (added > 0)
              error |= added;
            // else re-allocated
@@ -105,7 +122,7 @@
            // we don't stop encoding on single errors, but we sum them all up
            // as combined bitmask
          }
-@@ -2634,6 +2703,7 @@
+@@ -2634,6 +2720,7 @@
      }
    while (section_size > 2);
  
@@ -113,7 +130,43 @@
    free (hdl_dat.chain);
    free (obj_dat.chain);
    return error;
-@@ -5824,7 +5894,13 @@
+@@ -3955,6 +4042,16 @@
+   return 0;
+ }
+ 
++/* UNIMOG patch: a reader that never looks at extended data can skip it.
++   Some drawings carry hundreds of MB of EED (one calloc per data item). */
++static int skip_eed = 0;
++
++EXPORT void
++dwg_set_skip_eed (int on)
++{
++  skip_eed = on;
++}
++
+ /* for objects and entities */
+ int
+ dwg_decode_eed (Bit_Chain *restrict dat, Dwg_Object_Object *restrict obj)
+@@ -3996,6 +4093,18 @@
+           LOG_ERROR ("Invalid EED size " FORMAT_BS " > %u", size, _obj->size);
+           obj->num_eed = idx;
+           return DWG_ERR_INVALIDEED;
++        }
++
++      // UNIMOG: skip the data, keeping the position exactly as the
++      // "No EED handle" path below does. MLEADERSTYLE reads its version here.
++      if (skip_eed && dat->from_version >= R_13b1
++          && _obj->fixedtype != DWG_TYPE_MLEADERSTYLE)
++        {
++          Dwg_Handle h;
++          error |= bit_read_H (dat, &h);
++          sav_byte = dat->byte; // as the full path: start of the data
++          dat->byte += size;
++          continue; // idx stays 0: num_eed must match the NULL eed array
+         }
+ 
+       obj->num_eed = idx + 1;
+@@ -5824,7 +5933,13 @@
          }
      }
  
@@ -128,9 +181,66 @@
      { // empty only with UNKNOWN
        LOG_HANDLE (" object_map{" FORMAT_HV "} = %lu\n", obj->handle.value,
                    (unsigned long)num);
---- libredwg-0.14/include/dwg.h	2026-06-28 00:27:54
-+++ libredwg-0.14/include/dwg.h	2026-10-29 01:07:20
-@@ -11507,6 +11507,12 @@
+--- libredwg-0.14/src/decode_r2007.c
++++ libredwg-0.14/src/decode_r2007.c
+@@ -1723,6 +1723,7 @@
+   /* From here on the same code as in decode:read_2004_section_handles */
+   endpos = hdl_dat.byte + hdl_dat.size;
+   dwg->num_objects = 0;
++  stream_r2007_begin (); // UNIMOG streaming patch
+ 
+   do
+     {
+@@ -1737,6 +1738,7 @@
+       if (section_size > 2050)
+         {
+           LOG_ERROR ("Object-map/handles section size greater than 2050!");
++          stream_r2007_end ();
+           return DWG_ERR_VALUEOUTOFBOUNDS;
+         }
+ 
+@@ -1746,6 +1748,8 @@
+           int added;
+           BITCODE_UMC handleoff;
+           BITCODE_MC offset;
++          BITCODE_BL stream_nobj = dwg->num_objects;
++          BITCODE_BL stream_nrefs = dwg->num_object_refs;
+ 
+           oldpos = hdl_dat.byte;
+           handleoff = bit_read_UMC (&hdl_dat);
+@@ -1762,6 +1766,7 @@
+           added = dwg_decode_add_object (dwg, &obj_dat, hdl, last_offset);
+           if (added > 0)
+             error |= added;
++          stream_consume (dwg, stream_nobj, stream_nrefs);
+         }
+ 
+       if (hdl_dat.byte == oldpos)
+@@ -1792,6 +1797,7 @@
+     }
+   while (section_size > 2);
+ 
++  stream_r2007_end ();
+   if (hdl_dat.chain)
+     free (hdl_dat.chain);
+   if (obj_dat.chain)
+--- libredwg-0.14/src/decode.h
++++ libredwg-0.14/src/decode.h
+@@ -79,6 +79,11 @@
+                                                 unsigned int code);
+ int dwg_decode_header_variables (Bit_Chain *dat, Bit_Chain *hdl_dat,
+                                  Bit_Chain *str_dat, Dwg_Data *restrict dwg);
++/* UNIMOG streaming patch, see decode.c */
++void stream_r2007_begin (void);
++void stream_r2007_end (void);
++void stream_consume (Dwg_Data *restrict dwg, BITCODE_BL nobj,
++                     BITCODE_BL nrefs);
+ int dwg_decode_add_object (Dwg_Data *restrict dwg, Bit_Chain *dat,
+                            Bit_Chain *hdl_dat, size_t address);
+ int obj_handle_stream (Bit_Chain *restrict dat, Dwg_Object *restrict obj,
+--- libredwg-0.14/include/dwg.h
++++ libredwg-0.14/include/dwg.h
+@@ -11507,6 +11507,14 @@
  /*--------------------------------------------------
   * Exported Functions
   */
@@ -139,6 +249,8 @@
 +   (free) the just-decoded object. R2004+ object stream only. */
 +typedef int (*dwg_stream_cb) (Dwg_Data *dwg, Dwg_Object *obj, void *userdata);
 +EXPORT void dwg_set_stream_callback (dwg_stream_cb cb, void *userdata);
++/* UNIMOG patch: don't decode extended entity data (EED) at all. */
++EXPORT void dwg_set_skip_eed (int on);
 +EXPORT unsigned long dwg_stream_consumed (void);
  
  EXPORT int dwg_read_file (const char *restrict filename,
