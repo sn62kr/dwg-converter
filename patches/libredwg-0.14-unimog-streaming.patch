@@ -183,7 +183,47 @@
                    (unsigned long)num);
 --- libredwg-0.14/src/decode_r2007.c
 +++ libredwg-0.14/src/decode_r2007.c
-@@ -1723,6 +1723,7 @@
+@@ -788,6 +788,7 @@
+   uint64_t max_decomp_size;
+   BITCODE_RC *decomp, *decomp_end;
+   int error = 0, i;
++  int rs_encoded_raw; // UNIMOG patch
+ 
+   section = get_section (sections_map, sec_type);
+   sec_dat->chain = NULL;
+@@ -860,9 +861,28 @@
+         }
+ 
+       dat->byte = page->offset;
+-      // only if compressed. TODO: Isn't there a compressed flag as with 2004+?
+-      // theoretically the sizes could still be the same.
+-      if (section_page->comp_size != section_page->uncomp_size)
++      // UNIMOG patch: some writers store a wrong comp_size (equal to, or
++      // larger than, uncomp_size). Decide from the page's real size on disk:
++      // smaller than the data -> it is compressed; at least the RS-encoded
++      // size of the raw data -> raw but still RS-interleaved, which only
++      // read_data_page undoes (the memcpy below assumes plain bytes).
++      {
++        int64_t unc = section_page->uncomp_size;
++        int64_t rs_raw = (((unc + 7) & ~7) + 0xFB - 1) / 0xFB * 0xFF;
++        if (section_page->comp_size >= unc && (int64_t)page->size < unc
++            && page->size >= 0xFF)
++          {
++            LOG_WARN ("Page %d: comp_size %" PRId64 " but %" PRId64
++                      " bytes on disk, decompressing",
++                      (int)section_page->id, section_page->comp_size,
++                      (int64_t)page->size);
++            section_page->comp_size = (int64_t)page->size / 0xFF * 0xFB;
++          }
++        rs_encoded_raw = section_page->comp_size == unc
++                         && (int64_t)page->size >= rs_raw;
++      }
++      if (section_page->comp_size != section_page->uncomp_size
++          || rs_encoded_raw)
+         {
+           error = read_data_page (dat, &decomp[section_page->offset],
+                                   page->size, section_page->comp_size,
+@@ -1723,6 +1743,7 @@
    /* From here on the same code as in decode:read_2004_section_handles */
    endpos = hdl_dat.byte + hdl_dat.size;
    dwg->num_objects = 0;
@@ -191,7 +231,7 @@
  
    do
      {
-@@ -1737,6 +1738,7 @@
+@@ -1737,6 +1758,7 @@
        if (section_size > 2050)
          {
            LOG_ERROR ("Object-map/handles section size greater than 2050!");
@@ -199,7 +239,7 @@
            return DWG_ERR_VALUEOUTOFBOUNDS;
          }
  
-@@ -1746,6 +1748,8 @@
+@@ -1746,6 +1768,8 @@
            int added;
            BITCODE_UMC handleoff;
            BITCODE_MC offset;
@@ -208,7 +248,7 @@
  
            oldpos = hdl_dat.byte;
            handleoff = bit_read_UMC (&hdl_dat);
-@@ -1762,6 +1766,7 @@
+@@ -1762,6 +1786,7 @@
            added = dwg_decode_add_object (dwg, &obj_dat, hdl, last_offset);
            if (added > 0)
              error |= added;
@@ -216,7 +256,7 @@
          }
  
        if (hdl_dat.byte == oldpos)
-@@ -1792,6 +1797,7 @@
+@@ -1792,6 +1817,7 @@
      }
    while (section_size > 2);
  
