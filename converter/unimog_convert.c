@@ -37,7 +37,7 @@ static void count_paper(Ctx *c, const Dwg_Object *o) {
 static void set_origin(Ctx *c, Dwg_Data *dwg) {
   Dwg_Bitcode_3BD lo = dwg->header_vars.EXTMIN, hi = dwg->header_vars.EXTMAX;
   double span = fmax(hi.x - lo.x, hi.y - lo.y);
-  int ok = isfinite(span) && span > 0 && span < 1e12 && fabs(lo.x) < 1e15 &&
+  int ok = isfinite(span) && span > 1e-9 && span < 1e12 && fabs(lo.x) < 1e15 &&
            fabs(lo.y) < 1e15;
   Geom *b = c->b;
   b->ox = ok ? (lo.x + hi.x) / 2 : 0, b->oy = ok ? (lo.y + hi.y) / 2 : 0;
@@ -153,9 +153,11 @@ int main(int argc, char **argv) {
   if (overflow) fprintf(stderr, "styles over 65535: %lu\n", overflow);
   fprintf(stderr,
           "styles raw=%zu layers=%zu ltypes=%zu fills=%zu triangles=%zu "
-          "hatch_lines=%zu dense_hatches=%lu sort_entries=%zu xclips=%lu dims_drawn=%lu\n",
+          "hatch_lines=%zu dense_hatches=%lu sort_entries=%zu xclips=%lu dims_drawn=%lu "
+          "hatch_work_max=%.0f hatch_work_total=%.0f fill_work_max=%.0f fill_work_total=%.0f\n",
           g_styles.n, tab.n_layers, tab.n_ltypes, b.fills.n, b.fpts.n / 3,
-          b.hlines.n, n_hatch_dense, tab.sorts.n, n_xclip, g_dim_drawn);
+          b.hlines.n, n_hatch_dense, tab.sorts.n, n_xclip, g_dim_drawn, g_hatch_work_max, g_hatch_work_total,
+          ec_work_max, ec_work_total);
   size_t n_layers = tab.n_layers;
   tables_free(&tab);
   size_t zcap = ZSTD_compressBound(raw_n);

@@ -210,6 +210,8 @@ typedef struct {
   Vec fpts;   // UmgFPt
   Vec hlines;  // UmgLine: hatch pattern lines (drawn, not snapped)
   Vec fill_key, hline_key;  // OrdKey per fill, per hline
+  Vec hline_lod;  // float per hline: hidden when its lines get this close
+  float lod;      // ... for the hlines being added (INFINITY = always drawn)
   int model;                // model space (else a block definition)
   OrdKey ord;               // key of the area primitives being added
   Vec pool;   // char
@@ -229,11 +231,17 @@ static void geom_init(Geom *g, double q) {
   g->fill_st.elem = g->hline_st.elem = 4;
   g->hlines.elem = sizeof(UmgLine);
   g->fill_key.elem = g->hline_key.elem = sizeof(OrdKey);
+  g->hline_lod.elem = sizeof(float);
+  g->lod = INFINITY;
 }
 
 // Quantizes a length or an origin-relative coordinate to steps of q.
 static int32_t qz(Geom *g, double v) {
   double t = floor(v / g->q + 0.5);
+  if (t != t) {  // NaN from a damaged file
+    g->n_clamped++;
+    return 0;
+  }
   if (t > INT32_MAX || t < INT32_MIN) {
     g->n_clamped++;
     return t > 0 ? INT32_MAX : INT32_MIN;
@@ -252,7 +260,7 @@ static void geom_free(Geom *g) {
   free(g->texts.p), free(g->pool.p), free(g->fills.p), free(g->fpts.p);
   free(g->line_st.p), free(g->arc_st.p), free(g->poly_st.p), free(g->text_st.p);
   free(g->fill_st.p), free(g->hlines.p), free(g->hline_st.p);
-  free(g->fill_key.p), free(g->hline_key.p);
+  free(g->fill_key.p), free(g->hline_key.p), free(g->hline_lod.p);
 }
 
 static void geom_origin(Geom *g, double x, double y) {
@@ -281,6 +289,20 @@ static void add_hline(Geom *g, Xf m, double x1, double y1, double x2,
                       double y2) {
   push_line(g, &g->hlines, &g->hline_st, m, x1, y1, x2, y2);
   *(OrdKey *)vec_push(&g->hline_key) = g->ord;
+  *(float *)vec_push(&g->hline_lod) = g->lod;
+}
+
+// Level of detail for the k-th of evenly spaced items `step` apart (hatch
+// lines across a family, pattern repeats along a line): kept while items
+// 2^j apart stay visible, j = trailing zero bits of k, so zooming out halves
+// the count step by step and what stays is still even. k = 0 always stays.
+static float lod_key(double step, double k) {
+  if (!(fabs(k) < 9e15)) return (float)fabs(step);  // NaN or past exact integers
+  long long n = llabs((long long)k);
+  if (!n) return INFINITY;
+  int j = 0;
+  while (!(n & 1) && j < 40) n >>= 1, j++;
+  return (float)(fabs(step) * ldexp(1, j));
 }
 
 // Polyline: begin_poly, then add_pt per vertex. Bulge is tan(sweep / 4) of
@@ -605,8 +627,8 @@ static void loops_arc(Loops *L, double cx, double cy, double r, double a0,
 // closes this way).
 static void hatch_sweep(const Dwg_HATCH_PathSeg *s, double *a0, double *sw) {
   double d = s->end_angle - s->start_angle;
-  while (d <= 0) d += 2 * M_PI;
-  if (d > 2 * M_PI) d = 2 * M_PI;
+  if (!(d > 0)) d = fmod(d, 2 * M_PI) + 2 * M_PI;  // fmod: no loop on 1e300
+  if (!(d > 0) || d > 2 * M_PI) d = 2 * M_PI;
   *a0 = s->is_ccw ? s->start_angle : -s->start_angle;
   *sw = s->is_ccw ? d : -d;
 }
@@ -823,6 +845,12 @@ static int cmp_double(const void *a, const void *b) {
 }
 
 #define HATCH_MAX_SEGS 2000000  // work for one hatch; denser ones are dropped
+// Lines x loop edges visited, per hatch and per drawing. Real drawings:
+// at most 5e5 for one hatch (field), so these only stop damaged files
+// (fuzzing: one file ran for minutes).
+#define HATCH_MAX_WORK 2e7
+#define HATCH_MAX_WORK_TOTAL 4e8
+static double g_hatch_work_max, g_hatch_work_total;  // reported on stderr
 
 // Pattern hatch: each pattern line family (already scaled and rotated in the
 // DWG) is cut by the loops even-odd, then dashed (dots: zero-length lines).
@@ -843,15 +871,28 @@ static void pattern_lines(Geom *g, Xf m, const Dwg_Entity_HATCH *h,
     double sp = D->offset.x * nx + D->offset.y * ny;  // spacing across lines
     if (fabs(sp) < 1e-9) continue;
     double pat = 0;
-    for (BITCODE_BS j = 0; j < D->num_dashes; j++) pat += fabs(D->dashes[j]);
+    BITCODE_BS nd = D->dashes ? D->num_dashes : 0;  // count without data: solid
+    for (BITCODE_BS j = 0; j < nd; j++) pat += fabs(D->dashes[j]);
     double vmin = INFINITY, vmax = -INFINITY;  // loops across the lines
     for (size_t i = 0; i < L->xy.n; i++) {
       double v = (xy[2 * i] - D->pt0.x) * nx + (xy[2 * i + 1] - D->pt0.y) * ny;
       vmin = fmin(vmin, v), vmax = fmax(vmax, v);
     }
     double k0 = ceil(fmin(vmin / sp, vmax / sp)), k1 = floor(fmax(vmin / sp, vmax / sp));
-    // Work is bounded by lines and pattern repeats, not only by output.
-    if (count && (*count += (size_t)fmax(0, k1 - k0 + 1)) > HATCH_MAX_SEGS) goto done;
+    // Line numbers past exact doubles (2^53) would not advance with kk++
+    // (fuzzing: endless loop); no real hatch is that far from its origin.
+    if (!(fabs(k0) < 9e15 && fabs(k1) < 9e15)) continue;
+    // Work is bounded by lines and pattern repeats, not only by output, and
+    // by lines times the edges each line is cut against.
+    double nlines = fmax(0, k1 - k0 + 1);
+    double work = nlines * (double)ne;
+    if (count && work > g_hatch_work_max) g_hatch_work_max = work;
+    if (count && (!(nlines <= HATCH_MAX_SEGS) || work > HATCH_MAX_WORK ||
+                  (g_hatch_work_total += work) > HATCH_MAX_WORK_TOTAL)) {
+      *count = HATCH_MAX_SEGS + 1;
+      goto done;
+    }
+    if (count && (*count += (size_t)nlines) > HATCH_MAX_SEGS) goto done;
     for (double kk = k0; kk <= k1; kk++) {
       double ox = D->pt0.x + kk * D->offset.x, oy = D->pt0.y + kk * D->offset.y;
       size_t nt = 0;
@@ -868,6 +909,8 @@ static void pattern_lines(Geom *g, Xf m, const Dwg_Entity_HATCH *h,
         }
       }
       qsort(ts, nt, sizeof(double), cmp_double);
+      const float across = lod_key(sp, kk);
+      g->lod = across;
       for (size_t i = 0; i + 1 < nt; i += 2) {
         double t0 = ts[i], t1 = ts[i + 1];
 #define EMIT(a, b)                                                           \
@@ -884,11 +927,21 @@ static void pattern_lines(Geom *g, Xf m, const Dwg_Entity_HATCH *h,
           if (t1 - t0 > g->q) EMIT(t0, t1);
           continue;
         }
-        if (count && (*count += (size_t)((t1 - t0) / pat)) > HATCH_MAX_SEGS) goto done;
+        double reps = (t1 - t0) / pat;
+        if (count && (!(reps <= HATCH_MAX_SEGS) ||
+                      (*count += (size_t)reps) > HATCH_MAX_SEGS)) {
+          *count = HATCH_MAX_SEGS + 1;
+          goto done;
+        }
         double base = floor(t0 / pat) * pat;
-        for (; base < t1; base += pat) {
+        // Far from the pattern origin a short pattern stops advancing
+        // (base + pat == base in double): bound the repeats instead of
+        // trusting the sum (fuzzing: endless loop).
+        if (!(base + pat > base)) continue;
+        for (long rep = 0; base < t1 && rep <= (long)reps + 1; base += pat, rep++) {
           double acc = base;
-          for (BITCODE_BS j = 0; j < D->num_dashes; j++) {
+          g->lod = fminf(across, lod_key(pat, floor(base / pat + 0.5)));
+          for (BITCODE_BS j = 0; j < nd; j++) {
             double dl = D->dashes[j];
             if (dl > 0) {
               double a = fmax(acc, t0), b = fmin(acc + dl, t1);
@@ -904,6 +957,7 @@ static void pattern_lines(Geom *g, Xf m, const Dwg_Entity_HATCH *h,
     }
   }
 done:
+  g->lod = INFINITY;
   free(ts), free(st), free(depth);
 }
 
@@ -1615,8 +1669,10 @@ static void dim_arrow(Geom *g, const Dwg_Object *o, const DimVars *v,
                       double x, double y, double ux, double uy) {
   double s = v->scale;
   if (v->tsz > 0) {
-    double h = v->tsz * s, c = M_SQRT1_2;
-    double tx = (ux - uy) * c * h, ty = (uy + ux) * c * h;
+    // DIMTSZ is the stroke's reach along and across the line (public
+    // drawings' *D blocks: half-length DIMTSZ * sqrt 2).
+    double h = v->tsz * s;
+    double tx = (ux - uy) * h, ty = (uy + ux) * h;
     add_line(g, XF_ID, x - tx, y - ty, x + tx, y + ty);
   } else {
     add_ml_arrow(g, o, v->blk, x, y, ux, uy, v->asz * s);
@@ -1673,6 +1729,115 @@ static void dim_linear(Geom *g, const Dwg_Object *o, const DimVars *v,
   (void)nx, (void)ny;
 }
 
+// Extension line from the measured point (px, py) to (ax, ay) on the
+// dimension line or arc: DIMEXO short of the point, DIMEXE past the end.
+static void dim_ext(Geom *g, const DimVars *v, double px, double py,
+                    double ax, double ay) {
+  double dx = ax - px, dy = ay - py, len = hypot(dx, dy), s = v->scale;
+  if (len < 1e-9) return;
+  dx /= len, dy /= len;
+  double o0 = fmin(v->exo * s, len);
+  add_line(g, XF_ID, px + dx * o0, py + dy * o0, ax + dx * v->exe * s,
+           ay + dy * v->exe * s);
+}
+
+// Angular dimension arc around (cx, cy), radius r, counter-clockwise from
+// a0 to a1, with its arrows; *mid = the arc's middle angle.
+static void dim_arc(Geom *g, const Dwg_Object *o, const DimVars *v, double cx,
+                    double cy, double r, double a0, double a1, double *mid) {
+  if (a1 <= a0) a1 = a0 + fmod(a1 - a0, 2 * M_PI) + 2 * M_PI;
+  *mid = (a0 + a1) / 2;
+  add_arc(g, XF_ID, cx, cy, r, a0, a1);
+  // Each arrow lies along the chord from the tip to the arc point one arrow
+  // length further on (inside) or back (outside), as AutoCAD draws it.
+  double L = (v->tsz > 0 ? v->tsz : v->asz) * v->scale;
+  double phi = L > 0 ? 2 * asin(fmin(1, L / (2 * r))) : 1e-6;
+  int inside = v->tsz > 0 || r * (a1 - a0) > 2 * L;
+  double ends[2] = {a0, a1}, toward[2] = {inside ? phi : -phi, inside ? -phi : phi};
+  for (int i = 0; i < 2; i++) {
+    double a = ends[i], b = a + toward[i];
+    double tx = cx + r * cos(a), ty = cy + r * sin(a);
+    double dx = r * (cos(a) - cos(b)), dy = r * (sin(a) - sin(b)), n = hypot(dx, dy);
+    if (n > 0) dim_arrow(g, o, v, tx, ty, dx / n, dy / n);
+  }
+}
+
+// Angle a moved into [b, b + 2 pi).
+static double ang_from(double a, double b) {
+  a = fmod(a - b, 2 * M_PI);
+  return a < 0 ? a + 2 * M_PI : a;
+}
+
+// 3-point angular: vertex c, measured points p1 and p2, arc through `at`.
+// The arc spans the side of the two rays that holds `at` (may exceed 180).
+static int dim_ang3pt(Geom *g, const Dwg_Object *o, const DimVars *v,
+                      const Dwg_Entity_DIMENSION_ANG3PT *e, double *cx,
+                      double *cy, double *r, double *mid) {
+  *cx = e->center_pt.x, *cy = e->center_pt.y;
+  double ax = e->def_pt.x - *cx, ay = e->def_pt.y - *cy;
+  *r = hypot(ax, ay);
+  double p[2][2] = {{e->xline1_pt.x, e->xline1_pt.y}, {e->xline2_pt.x, e->xline2_pt.y}};
+  if (*r < 1e-9 || hypot(p[0][0] - *cx, p[0][1] - *cy) < 1e-9 ||
+      hypot(p[1][0] - *cx, p[1][1] - *cy) < 1e-9)
+    return 0;
+  double a1 = atan2(p[0][1] - *cy, p[0][0] - *cx), a2 = atan2(p[1][1] - *cy, p[1][0] - *cx);
+  int swap = ang_from(atan2(ay, ax), a1) > ang_from(a2, a1);
+  double b0 = swap ? a2 : a1, b1 = swap ? a1 : a2;
+  for (int i = 0; i < 2; i++) {
+    double a = i == 0 ? a1 : a2;
+    dim_ext(g, v, p[i][0], p[i][1], *cx + *r * cos(a), *cy + *r * sin(a));
+  }
+  dim_arc(g, o, v, *cx, *cy, *r, b0, b1, mid);
+  return 1;
+}
+
+// 2-line angular: lines (13 -> 14) and (15 -> 10), arc through DXF 16
+// around their intersection, in the quadrant of the four the lines make
+// that holds that point. R13+ files store 16 first (a 2RD) and 10 last:
+// LibreDWG reads them into def_pt and xline2end_pt, the other way round from
+// their DXF names (public drawings: the vertex came out right only so).
+static int dim_ang2ln(Geom *g, const Dwg_Object *o, const DimVars *v,
+                      const Dwg_DIMENSION_common *d,
+                      const Dwg_Entity_DIMENSION_ANG2LN *e, double *cx,
+                      double *cy, double *r, double *mid) {
+  int r13 = o->parent->header.version >= R_13b1;
+  BITCODE_3BD end2 = r13 ? e->xline2end_pt : d->def_pt;
+  BITCODE_3BD arc = r13 ? d->def_pt : e->xline2end_pt;
+  double q[2][2][2] = {{{e->xline1start_pt.x, e->xline1start_pt.y}, {e->xline1end_pt.x, e->xline1end_pt.y}},
+                       {{e->xline2start_pt.x, e->xline2start_pt.y}, {end2.x, end2.y}}};
+  double u[2][2];
+  for (int i = 0; i < 2; i++) {
+    double dx = q[i][1][0] - q[i][0][0], dy = q[i][1][1] - q[i][0][1], len = hypot(dx, dy);
+    if (len < 1e-9) return 0;
+    u[i][0] = dx / len, u[i][1] = dy / len;
+  }
+  double cr = u[0][0] * u[1][1] - u[0][1] * u[1][0];
+  if (fabs(cr) < 1e-9) return 0;  // parallel lines
+  double wx = q[1][0][0] - q[0][0][0], wy = q[1][0][1] - q[0][0][1];
+  double t = (wx * u[1][1] - wy * u[1][0]) / cr;  // along line 1
+  *cx = q[0][0][0] + u[0][0] * t, *cy = q[0][0][1] + u[0][1] * t;
+  double px = arc.x - *cx, py = arc.y - *cy;
+  *r = hypot(px, py);
+  if (*r < 1e-9) return 0;
+  // Ray signs: the arc point lies between rays s1*u1 and s2*u2.
+  double s1 = (px * u[1][1] - py * u[1][0]) * cr >= 0 ? 1 : -1;
+  double s2 = (u[0][0] * py - u[0][1] * px) * cr >= 0 ? 1 : -1;
+  double r1x = s1 * u[0][0], r1y = s1 * u[0][1], r2x = s2 * u[1][0], r2y = s2 * u[1][1];
+  double a1 = atan2(r1y, r1x), a2 = atan2(r2y, r2x);
+  int ccw = r1x * r2y - r1y * r2x > 0;
+  double rays[2][2] = {{r1x, r1y}, {r2x, r2y}};
+  for (int i = 0; i < 2; i++) {  // extension lines only off the line's ends
+    double ta = (q[i][0][0] - *cx) * rays[i][0] + (q[i][0][1] - *cy) * rays[i][1];
+    double tb = (q[i][1][0] - *cx) * rays[i][0] + (q[i][1][1] - *cy) * rays[i][1];
+    double lo = fmin(ta, tb), hi = fmax(ta, tb), from = *r > hi ? hi : *r < lo ? lo : *r;
+    if (from == *r) continue;
+    dim_ext(g, v, *cx + rays[i][0] * from, *cy + rays[i][1] * from,
+            *cx + rays[i][0] * *r, *cy + rays[i][1] * *r);
+  }
+  dim_arc(g, o, v, *cx, *cy, *r, ccw ? a1 : a2, ccw ? a2 : a1, mid);
+  return 1;
+}
+
 static void add_dimension(Geom *g, const Dwg_Object *o) {
   const Dwg_DIMENSION_common *d = o->tio.entity->tio.DIMENSION_LINEAR
                                       ? (const Dwg_DIMENSION_common *)o->tio.entity->tio.DIMENSION_LINEAR
@@ -1682,11 +1847,15 @@ static void add_dimension(Geom *g, const Dwg_Object *o) {
   // Annotative dimensions keep paper sizes (1/8") and are scaled by the
   // annotation scale, which lives in extension dictionaries we do not read.
   // Keep the text at least 1/200 of the drawing so it stays readable.
-  {
+  // Only for unscaled styles (DIMSCALE 1, as annotative ones are) whose
+  // text is clearly paper-sized (Autodesk samples: 7 to 58 times too
+  // small): a real DIMSCALE (public drawings: 50) is right, and extents can
+  // be far larger than the sheet, which blew arrows up many times.
+  if (v.scale <= 1) {
     Dwg_Bitcode_3BD lo = o->parent->header_vars.EXTMIN, hi = o->parent->header_vars.EXTMAX;
     double span = fmax(hi.x - lo.x, hi.y - lo.y);
     double want = isfinite(span) && span > 0 && span < 1e12 ? span / 200 : 0;
-    if (want > v.txt * v.scale) v.scale = want / v.txt;
+    if (want > 5 * v.txt * v.scale) v.scale = want / v.txt;
   }
   double h = v.txt * v.scale, rot = 0;
   double mx = d->text_midpt.x, my = d->text_midpt.y;  // default text spot
@@ -1694,6 +1863,7 @@ static void add_dimension(Geom *g, const Dwg_Object *o) {
   char val[64];
   const char *prefix = "";
   int angular = 0;
+  double outx = 0, outy = 0;  // angular: away from the vertex at the arc middle
   switch (o->fixedtype) {
   case DWG_TYPE_DIMENSION_LINEAR: {
     const Dwg_Entity_DIMENSION_LINEAR *l = o->tio.entity->tio.DIMENSION_LINEAR;
@@ -1734,9 +1904,17 @@ static void add_dimension(Geom *g, const Dwg_Object *o) {
     prefix = "%%c";
   } break;
   case DWG_TYPE_DIMENSION_ANG3PT:
-  case DWG_TYPE_DIMENSION_ANG2LN:
-    angular = 1;  // text only: the arc needs the quadrant logic
-    break;
+  case DWG_TYPE_DIMENSION_ANG2LN: {
+    double cx, cy, r, mid;
+    int ok = o->fixedtype == DWG_TYPE_DIMENSION_ANG3PT
+                 ? dim_ang3pt(g, o, &v, o->tio.entity->tio.DIMENSION_ANG3PT, &cx, &cy, &r, &mid)
+                 : dim_ang2ln(g, o, &v, d, o->tio.entity->tio.DIMENSION_ANG2LN, &cx, &cy, &r, &mid);
+    angular = ok ? 2 : 1;  // 1: degenerate, text only
+    if (ok) {  // unstored text: just outside the arc's middle
+      outx = cos(mid), outy = sin(mid);
+      mx = cx + r * outx, my = cy + r * outy;
+    }
+  } break;
   default:  // ordinate: text only
     break;
   }
@@ -1745,9 +1923,10 @@ static void add_dimension(Geom *g, const Dwg_Object *o) {
   double trot = d->text_rotation != 0 ? d->text_rotation : dim_readable(rot);
   if (angular || o->fixedtype == DWG_TYPE_DIMENSION_ORDINATE) trot = d->text_rotation;
   if (place) {  // above the dimension line (DIMTAD 1 look), else as stored
-    if (angular || o->fixedtype == DWG_TYPE_DIMENSION_ORDINATE) { free(t); g_dim_drawn++; return; }
+    if (angular == 1 || o->fixedtype == DWG_TYPE_DIMENSION_ORDINATE) { free(t); g_dim_drawn++; return; }
     double off = h / 2 + v.gap * v.scale + h * 0.2;
-    mx += -sin(trot) * off, my += cos(trot) * off;
+    if (angular) mx += outx * off, my += outy * off;
+    else mx += -sin(trot) * off, my += cos(trot) * off;
   } else {
     mx = d->text_midpt.x, my = d->text_midpt.y;
   }
@@ -1820,26 +1999,27 @@ static void convert_entity(Geom *g, const Dwg_Object *o) {
   } break;
   case DWG_TYPE_LWPOLYLINE: {
     Dwg_Entity_LWPOLYLINE *p = e->tio.LWPOLYLINE;
-    uint32_t n = p->num_points;
+    uint32_t n = p->points ? p->num_points : 0;
     if (n < 2) break;
     double *xy = (double *)malloc(n * 2 * sizeof(double));
     double *bul = (double *)calloc(n, sizeof(double));
     for (uint32_t i = 0; i < n; i++) {
       xy[2 * i] = p->points[i].x, xy[2 * i + 1] = p->points[i].y;
-      if (i < p->num_bulges) bul[i] = p->bulges[i];
+      if (p->bulges && i < p->num_bulges) bul[i] = p->bulges[i];
     }
     uint32_t flags = ((p->flag & 512) && poly_closes(n, bul) ? UMG_CLOSED : 0) |
                      (p->flag & 128 ? UMG_LTCONT : 0);  // plinegen
     add_bulged_poly(g, p->extrusion.z < 0 ? XF_MIRROR_X : XF_ID, xy, bul, n,
                     flags);
     int wide = p->const_width > 0;
-    for (uint32_t i = 0; i < p->num_widths && !wide; i++)
+    uint32_t nw = p->widths ? p->num_widths : 0;
+    for (uint32_t i = 0; i < nw && !wide; i++)
       wide = p->widths[i].start > 0 || p->widths[i].end > 0;
     if (wide) {
       double *w0 = (double *)malloc(n * sizeof(double));
       double *w1 = (double *)malloc(n * sizeof(double));
       for (uint32_t i = 0; i < n; i++) {
-        int own = p->const_width <= 0 && i < p->num_widths;
+        int own = p->const_width <= 0 && i < nw;
         w0[i] = own ? p->widths[i].start : p->const_width;
         w1[i] = own ? p->widths[i].end : p->const_width;
       }
@@ -2210,7 +2390,7 @@ static char *geom_serialize(const Geom *g, Tables *t, size_t *size,
   }
   const Vec *parts[] = {&g->lines, &g->arcs, &g->polys, &g->pts, &g->texts,
                         &g->fills, &g->fpts, &g->hlines, &fill_ord,
-                        &hline_ord, &styles, &layers,
+                        &hline_ord, &g->hline_lod, &styles, &layers,
                         &ltypes, &dashes, &st16[0], &st16[1], &st16[2],
                         &st16[3], &st16[4], &st16[5], &pool};
   const int np = sizeof parts / sizeof *parts;

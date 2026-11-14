@@ -20,8 +20,23 @@ typedef struct {
   EcNode *pool;
   size_t n, cap;
   Vec *out;
-  int full;  // pool exhausted: give up on this polygon
+  int full;  // pool exhausted or work budget spent: give up on this polygon
 } Ec;
+
+// Work budget: on damaged hatches (crossed or corrupt rings) the ear search
+// can loop for ever. Every loop step counts; past EC_WORK_MAX the polygon is
+// given up like an exhausted pool, past EC_WORK_TOTAL (per drawing) no more
+// fills are triangulated. Real drawings (484, 2026-11-12) need at most 1.3e6
+// per polygon and 1.4e7 per drawing; about 1.5 s per 1e9 steps on a Mac.
+// Maxima are reported on stderr (fill_work_max, fill_work_total).
+#ifndef EC_WORK_MAX
+#define EC_WORK_MAX 5e7
+#endif
+#ifndef EC_WORK_TOTAL
+#define EC_WORK_TOTAL 5e8
+#endif
+static double ec_work, ec_work_max, ec_work_total;
+#define EC_SPENT() (++ec_work > EC_WORK_MAX)
 
 static EcNode *ec_new(Ec *c, uint32_t i, double x, double y) {
   if (c->n == c->cap) { c->full = 1; return NULL; }
@@ -87,6 +102,7 @@ static int ec_middle_inside(const EcNode *a, const EcNode *b) {
   int inside = 0;
   double px = (a->x + b->x) / 2, py = (a->y + b->y) / 2;
   do {
+    if (EC_SPENT()) break;
     if (((p->y > py) != (p->next->y > py)) && p->next->y != p->y &&
         (px < (p->next->x - p->x) * (py - p->y) / (p->next->y - p->y) + p->x))
       inside = !inside;
@@ -98,6 +114,7 @@ static int ec_middle_inside(const EcNode *a, const EcNode *b) {
 static int ec_intersects_polygon(const EcNode *a, const EcNode *b) {
   const EcNode *p = a;
   do {
+    if (EC_SPENT()) break;
     if (p->i != a->i && p->next->i != a->i && p->i != b->i &&
         p->next->i != b->i && ec_intersects(p, p->next, a, b))
       return 1;
@@ -136,6 +153,7 @@ static EcNode *ec_filter(EcNode *start, EcNode *end) {
   EcNode *p = start;
   int again;
   do {
+    if (EC_SPENT()) break;
     again = 0;
     if (!p->steiner && (ec_equals(p, p->next) || ec_area(p->prev, p, p->next) == 0)) {
       ec_remove(p);
@@ -161,7 +179,7 @@ static int ec_is_ear(const EcNode *ear) {
   if (ec_area(a, b, d) >= 0) return 0;  // reflex
   double x0 = fmin(a->x, fmin(b->x, d->x)), y0 = fmin(a->y, fmin(b->y, d->y));
   double x1 = fmax(a->x, fmax(b->x, d->x)), y1 = fmax(a->y, fmax(b->y, d->y));
-  for (const EcNode *p = d->next; p != a; p = p->next)
+  for (const EcNode *p = d->next; p != a && !EC_SPENT(); p = p->next)
     if (p->x >= x0 && p->x <= x1 && p->y >= y0 && p->y <= y1 &&
         ec_point_in_triangle(a->x, a->y, b->x, b->y, d->x, d->y, p->x, p->y) &&
         ec_area(p->prev, p, p->next) >= 0)
@@ -172,6 +190,7 @@ static int ec_is_ear(const EcNode *ear) {
 static EcNode *ec_cure_local(Ec *c, EcNode *start) {
   EcNode *p = start;
   do {
+    if (EC_SPENT()) break;
     EcNode *a = p->prev, *b = p->next->next;
     if (!ec_equals(a, b) && ec_intersects(a, p, p->next, b) &&
         ec_locally_inside(a, b) && ec_locally_inside(b, a)) {
@@ -189,7 +208,8 @@ static void ec_linked(Ec *c, EcNode *ear, int pass);
 static void ec_split_earcut(Ec *c, EcNode *start) {
   EcNode *a = start;
   do {
-    for (EcNode *b = a->next->next; b != a->prev; b = b->next) {
+    if (EC_SPENT()) break;
+    for (EcNode *b = a->next->next; b != a->prev && !EC_SPENT(); b = b->next) {
       if (a->i != b->i && ec_valid_diagonal(a, b)) {
         EcNode *d = ec_split(c, a, b);
         if (!d) return;
@@ -206,6 +226,7 @@ static void ec_linked(Ec *c, EcNode *ear, int pass) {
   if (!ear || c->full) return;
   EcNode *stop = ear;
   while (ear->prev != ear->next) {
+    if (EC_SPENT()) { c->full = 1; return; }
     EcNode *prev = ear->prev, *next = ear->next;
     if (ec_is_ear(ear)) {
       ec_emit(c, prev, ear, next);
@@ -244,6 +265,7 @@ static EcNode *ec_ring(Ec *c, const double *xy, size_t a, size_t b, int clockwis
 static EcNode *ec_leftmost(EcNode *start) {
   EcNode *p = start, *l = start;
   do {
+    if (EC_SPENT()) break;
     if (p->x < l->x || (p->x == l->x && p->y < l->y)) l = p;
     p = p->next;
   } while (p != start);
@@ -259,6 +281,7 @@ static EcNode *ec_bridge(EcNode *hole, EcNode *outer) {
   EcNode *p = outer, *m = NULL;
   double hx = hole->x, hy = hole->y, qx = -INFINITY;
   do {  // nearest edge to the left of the hole point
+    if (EC_SPENT()) break;
     if (hy <= p->y && hy >= p->next->y && p->next->y != p->y) {
       double x = p->x + (hy - p->y) * (p->next->x - p->x) / (p->next->y - p->y);
       if (x <= hx && x > qx) {
@@ -276,6 +299,7 @@ static EcNode *ec_bridge(EcNode *hole, EcNode *outer) {
   double mx = m->x, my = m->y, tan_min = INFINITY;
   p = m;
   do {
+    if (EC_SPENT()) break;
     if (hx >= p->x && p->x >= mx && hx != p->x &&
         ec_point_in_triangle(hy < my ? hx : qx, hy, mx, my, hy < my ? qx : hx,
                              hy, p->x, p->y)) {
@@ -303,7 +327,9 @@ static int ec_cmp_x(const void *a, const void *b) {
 
 static void ec_triangulate(const double *xy, size_t n, const size_t *holes,
                            size_t nholes, Vec *out) {
+  if (ec_work_total > EC_WORK_TOTAL) return;
   Ec c = {NULL, 0, 3 * n + 2 * nholes + 16, out, 0};
+  ec_work = 0;
   c.pool = (EcNode *)malloc(c.cap * sizeof(EcNode));
   EcNode *outer = ec_ring(&c, xy, 0, nholes ? holes[0] : n, 1);
   if (outer && outer->next != outer->prev) {
@@ -330,4 +356,6 @@ static void ec_triangulate(const double *xy, size_t n, const size_t *holes,
     if (!c.full) ec_linked(&c, outer, 0);
   }
   free(c.pool);
+  if (ec_work > ec_work_max) ec_work_max = ec_work;
+  ec_work_total += ec_work;
 }

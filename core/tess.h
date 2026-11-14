@@ -2,13 +2,14 @@
 // snap index and the C++ renderer. A UMG8 image (zstd-compressed on disk) is:
 //   UmgHeader, lines UmgLine, arcs UmgArc, polys uint32, pts UmgPt,
 //   texts UmgText, fills uint32, fpts UmgFPt, hlines UmgLine,
-//   fill_ord uint32, hline_ord uint32, styles UmgStyle, layers UmgLayer, ltypes UmgLtype, dashes float, then
+//   fill_ord uint32, hline_ord uint32, hline_lod float, styles UmgStyle, layers UmgLayer, ltypes UmgLtype, dashes float, then
 //   one uint16 style index per line, arc, poly, text, fill and hline, then
 //   the UTF-8 pool (text strings, layer and linetype names). hlines are
 //   hatch pattern lines: drawn like lines, never snapped to; zero-length
 //   ones are pattern dots. Fills and hlines carry their draw-order rank
 //   (1..n_ord, later = on top); lines, arcs, polys and text are drawn above
-//   all of them.
+//   all of them. hline_lod: the hline is left out once its pattern lines
+//   are drawn closer than that (drawing units; see lod_key in convert.h).
 // Coordinates are int32 fixed point: world = (ox, oy) + value * q, with q a
 // power of two chosen per file from the drawing extents (sample01: 1/512 mm),
 // so measurements keep sub-micrometre precision. Angles and bulges are float.
@@ -106,6 +107,7 @@ typedef struct {
   const UmgFPt *fpts;
   const UmgLine *hlines;
   const uint32_t *fill_ord, *hline_ord;
+  const float *hline_lod;
   const UmgStyle *styles;
   const UmgLayer *layers;
   const UmgLtype *ltypes;
@@ -134,6 +136,7 @@ static inline int umg_view(const void *raw, size_t size, UmgView *v) {
   UMG_TAKE(hlines, UmgLine, h->n_hlines);
   UMG_TAKE(fill_ord, uint32_t, h->n_fills);
   UMG_TAKE(hline_ord, uint32_t, h->n_hlines);
+  UMG_TAKE(hline_lod, float, h->n_hlines);
   UMG_TAKE(styles, UmgStyle, h->n_styles);
   UMG_TAKE(layers, UmgLayer, h->n_layers);
   UMG_TAKE(ltypes, UmgLtype, h->n_ltypes);
@@ -183,8 +186,8 @@ static inline uint32_t umg_display_rgb(uint32_t rgb, int light, int fill) {
 }
 
 static inline int umg_arc_segs(double sweep) {
-  int n = (int)ceil(fabs(sweep) / (2 * M_PI) * 32);
-  return n < 4 ? 4 : n > 64 ? 64 : n;
+  double n = ceil(fabs(sweep) / (2 * M_PI) * 32);  // clamp before int: NaN, 1e58
+  return !(n >= 4) ? 4 : n > 64 ? 64 : (int)n;
 }
 
 // Arc through the bulged segment p1 -> p2 (bulge = tan(sweep / 4)).

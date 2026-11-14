@@ -57,6 +57,7 @@ typedef struct {
   double q;       // fixed-point step, same as the output Geom
   uint64_t layer0;  // LAYER "0" handle, for style inheritance
   unsigned long n_insert, n_dim, n_missing, n_deep, n_mirrored_text, n_xclip;
+  unsigned long n_minsert_capped;  // MINSERT arrays cut to MINSERT_MAX cells
 } Blocks;
 
 static size_t slot_of(const Blocks *s, uint64_t h) {
@@ -123,6 +124,9 @@ static Refs *refs_for(Blocks *s, const Dwg_Object_Entity *e) {
 static void blocks_add_dimension(Blocks *s, Geom *ms, const Dwg_Object *o) {
   Refs *r = refs_for(s, o->tio.entity);
   uint64_t h = ref_handle(o->tio.entity->tio.DIMENSION_LINEAR->block);
+#ifdef UNIMOG_DIM_SELF  // test build: draw angular dimensions from their data
+  if (o->fixedtype == DWG_TYPE_DIMENSION_ANG3PT || o->fixedtype == DWG_TYPE_DIMENSION_ANG2LN) h = 0;
+#endif
   if (r && !h) {
     const Dwg_Object_Entity *e = o->tio.entity;
     Geom *g = e->entmode == 2 ? ms : &block_get(s, ref_handle(e->ownerhandle))->geom;
@@ -199,6 +203,8 @@ static double *insert_clip(const Dwg_Object *o, uint32_t *n) {
       }                                                                       \
   } while (0)
 
+#define MINSERT_MAX 10000
+
 static void blocks_add_insert(Blocks *s, const Dwg_Object *o) {
   Dwg_Object_Entity *e = o->tio.entity;
   Refs *r = refs_for(s, e);
@@ -206,10 +212,19 @@ static void blocks_add_insert(Blocks *s, const Dwg_Object *o) {
   uint32_t st = entity_style(e);
   if (o->fixedtype == DWG_TYPE_INSERT)
     ADD_INSERT(INSERT, 1, 1, 0, 0);
-  else
-    ADD_INSERT(MINSERT, in->num_cols ? in->num_cols : 1,
-               in->num_rows ? in->num_rows : 1, in->col_spacing,
-               in->row_spacing);
+  else {
+    // A damaged file can ask for 65535 x 65535 copies (fuzzing: 5.9 GB of
+    // references, minutes of work); real arrays are small. Keep at most
+    // MINSERT_MAX cells, whole rows first.
+    const Dwg_Entity_MINSERT *mi = e->tio.MINSERT;
+    int nc = mi->num_cols ? mi->num_cols : 1, nr = mi->num_rows ? mi->num_rows : 1;
+    if ((long)nc * nr > MINSERT_MAX) {
+      if (nc > MINSERT_MAX) nc = MINSERT_MAX;
+      nr = MINSERT_MAX / nc;
+      s->n_minsert_capped++;
+    }
+    ADD_INSERT(MINSERT, nc, nr, in->col_spacing, in->row_spacing);
+  }
 }
 
 static void blocks_add_attrib(Blocks *s, Geom *ms, const Dwg_Object *o) {
@@ -408,9 +423,11 @@ static void emit_block(Blocks *s, Geom *out, uint64_t h, Xf xf, uint32_t style,
       add_line(out, m, x1, y1, x2, y2);
   }
   l = (const UmgLine *)g->hlines.p;
+  const double lod_scale = sqrt(fabs(xf_det(m)));
   for (size_t i = 0; i < g->hlines.n; i++, l++) {
     STYLE(hline_st, i);
     ORD(hline_key, i);
+    out->lod = (float)(((const float *)g->hline_lod.p)[i] * lod_scale);
     double x1 = WX(g, l->x1), y1 = WY(g, l->y1), x2 = WX(g, l->x2), y2 = WY(g, l->y2);
     if (!clipped)
       add_hline(out, m, x1, y1, x2, y2);
@@ -419,6 +436,7 @@ static void emit_block(Blocks *s, Geom *out, uint64_t h, Xf xf, uint32_t style,
     } else
       clips_segment(&cs, MX(x1, y1), MY(x1, y1), MX(x2, y2), MY(x2, y2), emit_hline, out);
   }
+  out->lod = INFINITY;
   const UmgArc *a = (const UmgArc *)g->arcs.p;
   for (size_t i = 0; i < g->arcs.n; i++, a++) {
     STYLE(arc_st, i);
