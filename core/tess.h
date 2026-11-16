@@ -1,8 +1,9 @@
-// UMG8 cache layout and load-time tessellation, shared by the converter, the
-// snap index and the C++ renderer. A UMG8 image (zstd-compressed on disk) is:
+// UMG9 cache layout and load-time tessellation, shared by the converter, the
+// snap index and the C++ renderer. A UMG9 image (zstd-compressed on disk) is:
 //   UmgHeader, lines UmgLine, arcs UmgArc, polys uint32, pts UmgPt,
 //   texts UmgText, fills uint32, fpts UmgFPt, hlines UmgLine,
-//   fill_ord uint32, hline_ord uint32, hline_lod float, styles UmgStyle, layers UmgLayer, ltypes UmgLtype, dashes float, then
+//   fill_ord uint32, hline_ord uint32, hline_lod float, dims UmgDim,
+//   styles UmgStyle, layers UmgLayer, ltypes UmgLtype, dashes float, then
 //   one uint16 style index per line, arc, poly, text, fill and hline, then
 //   the UTF-8 pool (text strings, layer and linetype names). hlines are
 //   hatch pattern lines: drawn like lines, never snapped to; zero-length
@@ -18,7 +19,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define UMG_MAGIC 0x38474D55u /* "UMG8" */
+#define UMG_MAGIC 0x39474D55u /* "UMG9" */
 #define UMG_CLOSED 0x80000000u
 #define UMG_LTCONT 0x40000000u  // linetype pattern runs on across vertices
 #define UMG_COUNT 0x3FFFFFFFu   // point count bits of a poly header
@@ -27,7 +28,7 @@
 typedef struct {
   uint32_t magic, n_lines, n_arcs, n_polys, n_pts, n_texts, pool_bytes;
   uint32_t n_styles, n_layers, n_ltypes, n_dashes, n_fills, n_fpts;
-  uint32_t n_hlines, n_ord;
+  uint32_t n_hlines, n_ord, n_dims;
   uint32_t units;  // header INSUNITS (D80): 0 unset, 1 inch, 4 mm, 6 m, ...
   double ox, oy, q;
 } UmgHeader;
@@ -56,6 +57,20 @@ typedef struct { int32_t x, y; float bulge; } UmgPt;  // bulge of next segment
 // Filled area (solid hatch, SOLID) as triangles: a fill is a uint32 vertex
 // count (a multiple of 3), its vertices follow in fpts.
 typedef struct { int32_t x, y; } UmgFPt;
+
+// A model-space linear or aligned dimension, for "the drawing says ..." when
+// a measurement spans the same two points (UMG9): its extension-line origins
+// (fixed point, like lines), the direction it measures along (radians), the
+// number it shows (drawing units, typed-over number when there is one) and
+// its DIMLFAC. flags: UMG_DIM_TYPED the number was typed over and differs
+// from the drawn length; UMG_DIM_ALIGNED measured along the points.
+#define UMG_DIM_TYPED 1u
+#define UMG_DIM_ALIGNED 2u
+typedef struct {
+  int32_t x1, y1, x2, y2;
+  float dir, shown, lfac;
+  uint32_t flags;
+} UmgDim;
 
 // One text item, already reduced to plain UTF-8 ('\n' = MTEXT paragraph).
 // Layout (font metrics, justification) happens on the device.
@@ -108,6 +123,7 @@ typedef struct {
   const UmgLine *hlines;
   const uint32_t *fill_ord, *hline_ord;
   const float *hline_lod;
+  const UmgDim *dims;
   const UmgStyle *styles;
   const UmgLayer *layers;
   const UmgLtype *ltypes;
@@ -137,6 +153,7 @@ static inline int umg_view(const void *raw, size_t size, UmgView *v) {
   UMG_TAKE(fill_ord, uint32_t, h->n_fills);
   UMG_TAKE(hline_ord, uint32_t, h->n_hlines);
   UMG_TAKE(hline_lod, float, h->n_hlines);
+  UMG_TAKE(dims, UmgDim, h->n_dims);
   UMG_TAKE(styles, UmgStyle, h->n_styles);
   UMG_TAKE(layers, UmgLayer, h->n_layers);
   UMG_TAKE(ltypes, UmgLtype, h->n_ltypes);

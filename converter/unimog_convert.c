@@ -1,20 +1,33 @@
 // unimog-convert: DWG -> UMG8 cache (exact fixed-point primitives + text,
 // styles, layers, linetypes; zstd). Runs as a separate process from the app
 // (GPL boundary, D31): the app only reads the UMG8 file this writes.
-//   unimog-convert in.dwg out.umg
+//   unimog-convert [-s] in.dwg out.umg   (in.dwg may also be a DXF, by content)
+//   -s  sandbox (the app always passes it): write out.umg directly (the
+//       caller renames it into place) and, once the DWG is in memory, lock
+//       the process down (sandbox.h). INFO then carries sandbox=on|failed.
+//   unimog-convert --sandbox-test   checks the lockdown on this device
 // stdout protocol, one line each:
 //   PROGRESS <objects decoded>      every 100k objects
 //   INFO key=value ...               drawing facts for the app (D86), before DONE
 //   DONE <ms> <primitives> <texts>  on success
 // Exit codes: 0 ok, 2 usage, 3 unreadable DWG, 4 cannot write output.
-// The output is written to out.umg.tmp and renamed, so a killed process
-// never leaves a half-written cache behind.
+// Without -s the output is written to out.umg.tmp and renamed, so a killed
+// process never leaves a half-written cache behind (with -s the caller
+// does that: a locked-down process cannot rename).
+
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <zstd.h>
 
 #include "blocks.h"
+#include "sandbox.h"
+
+static int g_sandbox = SANDBOX_NONE;
+static void enter_sandbox(void *unused) {
+  (void)unused;
+  g_sandbox = sandbox_enter();
+}
 
 typedef struct {
   Geom *b;
@@ -81,9 +94,9 @@ static void handle_kept(Ctx *c, const Dwg_Object *o) {
     count_paper(c, o);
   } else if (o->tio.entity->entmode == 2) {
     convert_entity(c->b, o);  // unsupported types are counted as skipped
-  } else if (o->tio.entity->entmode == 0 && o->fixedtype != DWG_TYPE_VERTEX_2D &&
-             o->fixedtype != DWG_TYPE_VERTEX_3D && o->fixedtype != DWG_TYPE_SEQEND &&
-             o->fixedtype != DWG_TYPE_ATTDEF) {
+  } else if (o->tio.entity->entmode == 0 &&
+             !(o->fixedtype >= DWG_TYPE_VERTEX_2D && o->fixedtype <= DWG_TYPE_VERTEX_PFACE_FACE) &&
+             o->fixedtype != DWG_TYPE_SEQEND && o->fixedtype != DWG_TYPE_ATTDEF) {
     // Non-streamed entity inside a block (old-style POLYLINE, ...).
     convert_entity(&block_get(c->blk, ref_handle(o->tio.entity->ownerhandle))->geom, o);
   }
@@ -104,10 +117,63 @@ static int on_object(Dwg_Data *dwg, Dwg_Object *o, void *ud) {
   return 1;
 }
 
+// DXF instead of DWG (by content: apps send both as octet-stream, and the
+// app stores every drawing as .dwg). A DWG starts with its version "AC1...";
+// a DXF with "AutoCAD Binary DXF" or group-code text ("0" / "999").
+// LibreDWG's DXF reader leaves entmode 3 ("owner unknown") with the owner
+// handle set; a DWG read says 2 model space, 1 paper space, 0 in a block.
+// Old-style polylines in blocks were left out (handle_kept wants 0).
+static void dxf_fix_entmode(Dwg_Data *d) {
+  uint64_t ms = d->header_vars.BLOCK_RECORD_MSPACE ? d->header_vars.BLOCK_RECORD_MSPACE->absolute_ref : 0;
+  uint64_t ps = d->header_vars.BLOCK_RECORD_PSPACE ? d->header_vars.BLOCK_RECORD_PSPACE->absolute_ref : 0;
+  // R12 has no owner handles: only a BLOCK names its block header, and
+  // what follows it up to ENDBLK belongs to that block. Outside BLOCK ...
+  // ENDBLK, an entity without an owner is in model space (ENTITIES).
+  BITCODE_H blk = NULL;
+  for (BITCODE_BL i = 0; i < d->num_objects; i++) {
+    Dwg_Object *o = &d->object[i];
+    if (o->supertype != DWG_SUPERTYPE_ENTITY || !o->tio.entity) continue;
+    Dwg_Object_Entity *e = o->tio.entity;
+    if (o->fixedtype == DWG_TYPE_BLOCK) blk = e->ownerhandle;
+    else if (o->fixedtype == DWG_TYPE_ENDBLK) { if (!e->ownerhandle) e->ownerhandle = blk; blk = NULL; }
+    else if (!e->ownerhandle && blk) e->ownerhandle = blk;
+    if (e->entmode != 3) continue;
+    uint64_t ow = e->ownerhandle ? e->ownerhandle->absolute_ref : 0;
+    e->entmode = !ow || ow == ms ? 2 : ow == ps ? 1 : 0;
+  }
+}
+
+static int looks_dxf(const char *path) {
+  FILE *f = fopen(path, "rb");
+  if (!f) return 0;
+  char b[32] = {0};
+  size_t n = fread(b, 1, sizeof b - 1, f);
+  fclose(f);
+  if (n < 6 || !memcmp(b, "AC1", 3) || !memcmp(b, "AC2", 3) || !memcmp(b, "MC0", 3)) return 0;
+  if (!memcmp(b, "AutoCAD Binary DXF", 18)) return 1;
+  const char *p = b;
+  if (!memcmp(p, "\xEF\xBB\xBF", 3)) p += 3;  // UTF-8 BOM
+  while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+  return (p[0] == '0' || !strncmp(p, "999", 3)) && (p[1] == '\r' || p[1] == '\n' || p[1] == '9');
+}
+
 int main(int argc, char **argv) {
+  if (argc == 2 && !strcmp(argv[1], "--sandbox-test")) {
+    int st = sandbox_enter();
+    printf("SANDBOX %s\n", SANDBOX_NAME[st]);
+    return st == SANDBOX_ON ? (sandbox_selftest() ? 1 : 0) : 1;
+  }
+  int sandboxed = argc == 4 && !strcmp(argv[1], "-s");
+  if (sandboxed) argv++, argc--;
   if (argc != 3) {
-    fprintf(stderr, "usage: %s in.dwg out.umg\n", argv[0]);
+    fprintf(stderr, "usage: %s [-s] in.dwg out.umg\n", argv[0]);
     return 2;
+  }
+  // Sandboxed: the output must be open before the lockdown.
+  FILE *out = NULL;
+  if (sandboxed && !(out = fopen(argv[2], "wb"))) {
+    fprintf(stderr, "cannot write %s\n", argv[2]);
+    return 4;
   }
   double t0 = now_s();
   Dwg_Data dwg;
@@ -121,8 +187,15 @@ int main(int argc, char **argv) {
 
   dwg_set_skip_eed(1);  // never read; some drawings carry hundreds of MB
   dwg_set_stream_callback(on_object, &ctx);
-  int err = dwg_read_file(argv[1], &dwg);
+  if (sandboxed) dwg_set_before_decode(enter_sandbox, NULL);
+  int dxf = looks_dxf(argv[1]);
+  // A DXF is read for an R2000 target: LibreDWG then keeps all its strings
+  // as bytes (for R2007+ it stored table names as UTF-16 but other strings
+  // as UTF-8, and looked names up wrongly: blocks and layers were lost).
+  if (dxf) dwg.header.version = R_2000;
+  int err = dxf ? dxf_read_file(argv[1], &dwg) : dwg_read_file(argv[1], &dwg);
   dwg_set_stream_callback(NULL, NULL);
+  if (dxf && err < DWG_ERR_CRITICAL) dxf_fix_entmode(&dwg);
   if (err >= DWG_ERR_CRITICAL) {
     fprintf(stderr, "dwg_read_file failed: 0x%x\n", err);
     return 3;
@@ -141,7 +214,10 @@ int main(int argc, char **argv) {
   tab.units = (uint32_t)dwg.header_vars.INSUNITS;
   const char *ver = dwg_version_type(dwg.header.from_version);
   Dwg_Bitcode_3BD emin = dwg.header_vars.EXTMIN, emax = dwg.header_vars.EXTMAX;
-  dwg_free(&dwg);
+  // A DXF read can leave pointers dwg_free must not free (LibreDWG 0.14:
+  // an invalid free in dwg_free_LINE on one public drawing). The process
+  // ends right after; let the system take the memory back.
+  if (!dxf) dwg_free(&dwg);
   blk.layer0 = tab.layer0;
   blocks_expand(&blk, &b);
   unsigned long n_xclip = blk.n_xclip;
@@ -167,12 +243,12 @@ int main(int argc, char **argv) {
 
   char tmp[4096];
   snprintf(tmp, sizeof tmp, "%s.tmp", argv[2]);
-  FILE *f = fopen(tmp, "wb");
+  FILE *f = sandboxed ? out : fopen(tmp, "wb");
   int ok = f && !ZSTD_isError(z_n) && fwrite(z, 1, z_n, f) == z_n;
   if (f) ok = (fclose(f) == 0) && ok;
   free(z);
-  if (!ok || rename(tmp, argv[2]) != 0) {
-    remove(tmp);
+  if (!ok || (!sandboxed && rename(tmp, argv[2]) != 0)) {
+    if (!sandboxed) remove(tmp);  // sandboxed: the caller deletes it
     fprintf(stderr, "cannot write %s\n", argv[2]);
     return 4;
   }
@@ -183,15 +259,20 @@ int main(int argc, char **argv) {
     snprintf(skipped + at, sizeof skipped - at, "%s%s:%lu", i ? "," : "",
              g_unsup[i].name, g_unsup[i].n);
   }
+  if (dxf && dxf_broken_count()) {  // DXF objects LibreDWG could not read (left out)
+    size_t at = strlen(skipped);
+    snprintf(skipped + at, sizeof skipped - at, "%sDXF_BROKEN:%lu", at ? "," : "", dxf_broken_count());
+  }
   if (g_unsup_other) {
     size_t at = strlen(skipped);
     snprintf(skipped + at, sizeof skipped - at, "%sOTHER:%lu", at ? "," : "", g_unsup_other);
   }
   printf("INFO ver=%s units=%u ext=%.1f,%.1f,%.1f,%.1f layers=%zu paper=%lu "
-         "prims=%zu texts=%zu skipped=%s\n",
+         "prims=%zu texts=%zu skipped=%s%s%s\n",
          ver ? ver : "?", tab.units, emin.x, emin.y, emax.x, emax.y, n_layers,
          ctx.n_paper, b.lines.n + b.arcs.n + b.polys.n + b.fills.n + b.hlines.n,
-         b.texts.n, skipped[0] ? skipped : "-");
+         b.texts.n, skipped[0] ? skipped : "-", sandboxed ? " sandbox=" : "",
+         sandboxed ? SANDBOX_NAME[g_sandbox] : "");
   printf("DONE %.0f %zu %zu\n", (now_s() - t0) * 1e3,
          b.lines.n + b.arcs.n + b.polys.n + b.fills.n + b.hlines.n, b.texts.n);
   geom_free(&b);

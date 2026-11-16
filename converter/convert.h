@@ -211,6 +211,7 @@ typedef struct {
   Vec hlines;  // UmgLine: hatch pattern lines (drawn, not snapped)
   Vec fill_key, hline_key;  // OrdKey per fill, per hline
   Vec hline_lod;  // float per hline: hidden when its lines get this close
+  Vec dims;       // UmgDim (model space only)
   float lod;      // ... for the hlines being added (INFINITY = always drawn)
   int model;                // model space (else a block definition)
   OrdKey ord;               // key of the area primitives being added
@@ -232,6 +233,7 @@ static void geom_init(Geom *g, double q) {
   g->hlines.elem = sizeof(UmgLine);
   g->fill_key.elem = g->hline_key.elem = sizeof(OrdKey);
   g->hline_lod.elem = sizeof(float);
+  g->dims.elem = sizeof(UmgDim);
   g->lod = INFINITY;
 }
 
@@ -261,6 +263,7 @@ static void geom_free(Geom *g) {
   free(g->line_st.p), free(g->arc_st.p), free(g->poly_st.p), free(g->text_st.p);
   free(g->fill_st.p), free(g->hlines.p), free(g->hline_st.p);
   free(g->fill_key.p), free(g->hline_key.p), free(g->hline_lod.p);
+  free(g->dims.p);
 }
 
 static void geom_origin(Geom *g, double x, double y) {
@@ -1050,6 +1053,15 @@ static size_t polyline_vertices(const Dwg_Object *o, BITCODE_BL num_owned,
       if (x == l) break;
     }
   }
+  // A DXF (R12 always) has no vertex links: the VERTEXes simply follow
+  // the POLYLINE up to its SEQEND, and LibreDWG keeps them in that order.
+  if (!out->n && (d->opts & DWG_OPTS_IN)) {
+    Dwg_Object *x = dwg_next_object(o);
+    for (size_t k = 0; x && k < 10000000 && x->fixedtype >= DWG_TYPE_VERTEX_2D &&
+                       x->fixedtype <= DWG_TYPE_VERTEX_PFACE_FACE;
+         k++, x = dwg_next_object(x))
+      *(Dwg_Object **)vec_push(out) = x;
+  }
   return out->n;
 }
 
@@ -1417,10 +1429,19 @@ static int64_t mtext_inline_color(const char *s) {
 }
 
 // Returns a UTF-8 copy of a DWG string (caller frees), or NULL.
+// Strings are UTF-16 (TU) when read from an R2007+ DWG. A DXF is read for
+// an R2000 target (unimog_convert.c), so its strings are bytes: UTF-8 when
+// the DXF is R2007+, else in the drawing's codepage (CP949 here).
+static int dwg_strings_tu(const Dwg_Data *dwg) {
+  return (dwg->opts & DWG_OPTS_IN) ? dwg->header.version >= R_2007
+                                   : dwg->header.from_version >= R_2007;
+}
+
 static char *dwg_utf8(const Dwg_Object *o, BITCODE_T str) {
   if (!str) return NULL;
   Dwg_Data *dwg = o->parent;
-  if (dwg->header.from_version >= R_2007) return bit_convert_TU((BITCODE_TU)str);
+  if (dwg_strings_tu(dwg)) return bit_convert_TU((BITCODE_TU)str);
+  if ((dwg->opts & DWG_OPTS_IN) && dwg->header.from_version >= R_2007) return strdup(str);
   char *r = bit_TV_to_utf8(str, dwg->header.codepage);
   return r == str ? strdup(str) : r;
 }
@@ -1559,8 +1580,9 @@ static void add_multileader(Geom *g, const Dwg_Object *o) {
 static unsigned long g_dim_drawn;  // dimensions drawn without a *D block
 
 typedef struct {
-  double asz, txt, scale, exo, exe, gap, tsz, lfac, dle;
+  double asz, txt, scale, exo, exe, gap, tsz, lfac, dle, rnd;
   int dec, adec, lunit, zin;
+  int overridden;  // values from the dimension's own DSTYLE overrides
   BITCODE_H blk;
 } DimVars;
 
@@ -1570,8 +1592,66 @@ typedef struct {
     V.exo = S.DIMEXO, V.exe = S.DIMEXE, V.gap = S.DIMGAP, V.tsz = S.DIMTSZ;   \
     V.lfac = S.DIMLFAC, V.dle = S.DIMDLE, V.dec = S.DIMDEC;                   \
     V.adec = S.DIMADEC, V.lunit = S.DIMLUNIT, V.zin = S.DIMZIN;               \
-    V.blk = S.DIMBLK;                                                         \
+    V.rnd = S.DIMRND, V.blk = S.DIMBLK;                                       \
   } while (0)
+
+// EED string item (code 0) equal to want.
+static int eed_is(const Dwg_Data *dwg, const Dwg_Eed_Data *x, const char *want) {
+  if (x->code != 0) return 0;
+  size_t n = strlen(want);
+  if (dwg_strings_tu(dwg)) {
+    if (x->u.eed_0_r2007.length != n) return 0;
+    for (size_t i = 0; i < n; i++)
+      if (x->u.eed_0_r2007.string[i] != (DWGCHAR)want[i]) return 0;
+    return 1;
+  }
+  return x->u.eed_0.length == n && !memcmp(x->u.eed_0.string, want, n);
+}
+
+// Per-dimension style overrides: AutoCAD keeps them in the dimension's
+// extended data as ACAD "DSTYLE" { 1070 group code, value, ... }. Field
+// drawings use them for details (DIMLFAC 1/3) and decimals. The decoder
+// keeps EED for dimensions only (patch, decode.c dwg_decode_eed).
+static int dim_overrides(const Dwg_Object *o, DimVars *v) {
+  const Dwg_Object_Entity *e = o->tio.entity;
+  int n = 0;
+  for (BITCODE_BL i = 0; e->eed && i + 1 < e->num_eed; i++) {
+    if (!e->eed[i].data || !eed_is(o->parent, e->eed[i].data, "DSTYLE")) continue;
+    for (BITCODE_BL j = i + 1; j + 1 < e->num_eed; j++) {
+      const Dwg_Eed_Data *k = e->eed[j].data;
+      if (!k) break;
+      if (k->code == 2) { if (k->u.eed_2.close) break; continue; }
+      if (k->code != 70) continue;
+      const Dwg_Eed_Data *val = e->eed[j + 1].data;
+      if (!val) break;
+      double num = val->code == 40 ? val->u.eed_40.real
+                   : val->code == 70 ? (double)(int16_t)val->u.eed_70.rs
+                   : val->code == 71 ? (double)(int32_t)val->u.eed_71.rl
+                                     : NAN;
+      j++;
+      if (isnan(num)) continue;
+      n++;
+      switch (k->u.eed_70.rs) {
+      case 144: v->lfac = num; break;
+      case 271: v->dec = (int)num; break;
+      case 78: v->zin = (int)num; break;
+      case 40: v->scale = num; break;
+      case 41: v->asz = num; break;
+      case 140: v->txt = num; break;
+      case 142: v->tsz = num; break;
+      case 42: v->exo = num; break;
+      case 44: v->exe = num; break;
+      case 147: v->gap = num; break;
+      case 277: v->lunit = (int)num; break;
+      case 179: v->adec = (int)num; break;
+      case 46: v->dle = num; break;
+      case 45: v->rnd = num; break;
+      }
+    }
+    break;
+  }
+  return n;
+}
 
 static DimVars dim_vars(const Dwg_Object *o, BITCODE_H style) {
   DimVars v;
@@ -1583,7 +1663,9 @@ static DimVars dim_vars(const Dwg_Object *o, BITCODE_H style) {
     const Dwg_Object_DIMSTYLE *d = ds->tio.object->tio.DIMSTYLE;
     DIMVARS_FROM(v, (*d));
   }
+  v.overridden = dim_overrides(o, &v);
   if (!(v.scale > 0)) v.scale = 1;
+  if (!(v.rnd > 0) || !isfinite(v.rnd)) v.rnd = 0;
   if (!(v.lfac != 0)) v.lfac = 1;
   if (!(v.txt > 0)) v.txt = 2.5;
   if (!(v.asz >= 0)) v.asz = v.txt;
@@ -1593,7 +1675,11 @@ static DimVars dim_vars(const Dwg_Object *o, BITCODE_H style) {
 }
 
 // Number as decimal with dec places; DIMZIN 8 drops trailing zeros.
+// Halves round away from zero as AutoCAD does (542.5 -> 543; printf would
+// give the even 542), with a little slack for values a hair under .5.
 static void dim_decimal(char *out, size_t n, double v, int dec, int zin) {
+  double f = pow(10, dec), s = v * f;
+  if (fabs(s) < 1e15) v = round(s + copysign(1e-9 * fmax(1, fabs(s)), s)) / f;
   snprintf(out, n, "%.*f", dec, v);
   if ((zin & 8) && strchr(out, '.')) {
     char *e = out + strlen(out) - 1;
@@ -1622,10 +1708,11 @@ static void dim_value(char *out, size_t n, const DimVars *v, double meas,
     char num[48];
     dim_decimal(num, sizeof num, meas * 180 / M_PI, v->adec, v->zin);
     snprintf(out, n, "%s%%%%d", num);
-  } else if (v->lunit == 4) {
-    dim_arch(out, n, meas * v->lfac, v->dec);
   } else {
-    dim_decimal(out, n, meas * v->lfac, v->dec, v->zin);
+    double x = meas * v->lfac;
+    if (v->rnd > 0) x = round(x / v->rnd) * v->rnd;  // DIMRND
+    if (v->lunit == 4) dim_arch(out, n, x, v->dec);
+    else dim_decimal(out, n, x, v->dec, v->zin);
   }
 }
 
@@ -1838,6 +1925,115 @@ static int dim_ang2ln(Geom *g, const Dwg_Object *o, const DimVars *v,
   return 1;
 }
 
+// Length the definition points give (linear, aligned, radius, diameter,
+// ordinate); 0 for angular dimensions.
+static double dim_geom(const Dwg_Object *o) {
+  const Dwg_Object_Entity *e = o->tio.entity;
+  switch ((int)o->fixedtype) {
+  case DWG_TYPE_DIMENSION_LINEAR: {
+    const Dwg_Entity_DIMENSION_LINEAR *l = e->tio.DIMENSION_LINEAR;
+    return fabs((l->xline2_pt.x - l->xline1_pt.x) * cos(l->dim_rotation) +
+                (l->xline2_pt.y - l->xline1_pt.y) * sin(l->dim_rotation));
+  }
+  case DWG_TYPE_DIMENSION_ALIGNED: {
+    const Dwg_Entity_DIMENSION_ALIGNED *l = e->tio.DIMENSION_ALIGNED;
+    return hypot(l->xline2_pt.x - l->xline1_pt.x, l->xline2_pt.y - l->xline1_pt.y);
+  }
+  case DWG_TYPE_DIMENSION_RADIUS: {
+    const Dwg_Entity_DIMENSION_RADIUS *r = e->tio.DIMENSION_RADIUS;
+    return hypot(r->first_arc_pt.x - r->def_pt.x, r->first_arc_pt.y - r->def_pt.y);
+  }
+  case DWG_TYPE_DIMENSION_DIAMETER: {
+    const Dwg_Entity_DIMENSION_DIAMETER *r = e->tio.DIMENSION_DIAMETER;
+    return hypot(r->first_arc_pt.x - r->def_pt.x, r->first_arc_pt.y - r->def_pt.y);
+  }
+  case DWG_TYPE_DIMENSION_ORDINATE: {
+    const Dwg_Entity_DIMENSION_ORDINATE *r = e->tio.DIMENSION_ORDINATE;
+    const Dwg_DIMENSION_common *d = (const Dwg_DIMENSION_common *)r;
+    int xaxis = (d->flag & 64) || r->flag2;
+    return fabs(xaxis ? r->feature_location_pt.x - d->def_pt.x
+                      : r->feature_location_pt.y - d->def_pt.y);
+  }
+  }
+  return 0;
+}
+
+// Some programs store the measurement already times DIMLFAC (field
+// drawings: details at 1/3 and 1/10, the oracle's "scaled"). Multiplying
+// again would show the number a third or a tenth too small; when the stored
+// value is the drawn length times DIMLFAC, show it as it is.
+static void dim_prescaled(const Dwg_Object *o, DimVars *v) {
+  const Dwg_DIMENSION_common *d = (const Dwg_DIMENSION_common *)o->tio.entity->tio.DIMENSION_LINEAR;
+  double act = d->act_measurement, gv = dim_geom(o);
+  if (fabs(v->lfac - 1) > 1e-9 && act != 0 && gv > 0 && isfinite(act) &&
+      fabs(gv - act) > 1e-6 * fabs(act) && fabs(gv * fabs(v->lfac) - act) <= 1e-6 * fabs(act))
+    v->lfac = 1;
+}
+
+// First number in s (thousands commas allowed); 0 when there is none.
+static int text_number(const char *s, double *out) {
+  for (; *s; s++) {
+    if (!(*s >= '0' && *s <= '9') && !(*s == '.' && s[1] >= '0' && s[1] <= '9')) continue;
+    char buf[64];
+    int k = 0, dot = 0;
+    while (*s && k < 62) {
+      if (*s >= '0' && *s <= '9') buf[k++] = *s;
+      else if (*s == ',' && s[1] >= '0' && s[1] <= '9' && !dot) ;  // separator
+      else if (*s == '.' && !dot && s[1] >= '0' && s[1] <= '9') buf[k++] = '.', dot = 1;
+      else break;
+      s++;
+    }
+    buf[k] = 0;
+    *out = strtod(buf, NULL);
+    return 1;
+  }
+  return 0;
+}
+
+// Keeps a model-space linear or aligned dimension for the app (UmgDim):
+// what the drawing says between its two points. Hidden text (" ") and
+// words without a number are left out.
+static void dim_record(Geom *g, const Dwg_Object *o) {
+  const Dwg_Object_Entity *e = o->tio.entity;
+  if (e->entmode != 2 || g->dims.n >= 200000) return;
+  int aligned = o->fixedtype == DWG_TYPE_DIMENSION_ALIGNED;
+  if (o->fixedtype != DWG_TYPE_DIMENSION_LINEAR && !aligned) return;
+  const Dwg_Entity_DIMENSION_LINEAR *l = e->tio.DIMENSION_LINEAR;  // same layout as ALIGNED
+  const Dwg_DIMENSION_common *d = (const Dwg_DIMENSION_common *)l;
+  if (!l || !d) return;
+  double x1 = l->xline1_pt.x, y1 = l->xline1_pt.y, x2 = l->xline2_pt.x, y2 = l->xline2_pt.y;
+  double act = d->act_measurement;
+  if (!isfinite(x1 + y1 + x2 + y2) || !(act > 0) || !isfinite(act)) return;
+  double dir = aligned ? atan2(y2 - y1, x2 - x1) : l->dim_rotation;
+  if (!isfinite(dir)) return;
+  DimVars v = dim_vars(o, d->dimstyle);
+  double lfac0 = v.lfac;
+  dim_prescaled(o, &v);
+  double shown = act * fabs(v.lfac);
+  if (v.rnd > 0) shown = round(shown / v.rnd) * v.rnd;
+  double f = pow(10, v.dec);
+  shown = round(shown * f + copysign(1e-9 * fmax(1, fabs(shown * f)), shown)) / f;
+  uint32_t flags = aligned ? UMG_DIM_ALIGNED : 0;
+  char *u = dwg_utf8(o, d->user_text);
+  if (u && *u) {
+    if (!strcmp(u, " ")) { free(u); return; }  // number hidden
+    if (!strstr(u, "<>")) {  // typed over
+      Vec c = {NULL, 0, 0, 1};
+      pool_clean(&c, u, 1);
+      vec_append(&c, "", 1);
+      double typed;
+      int ok = text_number((const char *)c.p, &typed);
+      free(c.p);
+      if (!ok) { free(u); return; }
+      if (fabs(typed - shown) > 0.5 / f + 1e-9 * fabs(shown)) shown = typed, flags |= UMG_DIM_TYPED;
+    }
+  }
+  free(u);
+  UmgDim *r = (UmgDim *)vec_push(&g->dims);
+  r->x1 = QX(g, x1), r->y1 = QY(g, y1), r->x2 = QX(g, x2), r->y2 = QY(g, y2);
+  r->dir = (float)dir, r->shown = (float)shown, r->lfac = (float)fabs(lfac0), r->flags = flags;
+}
+
 static void add_dimension(Geom *g, const Dwg_Object *o) {
   const Dwg_DIMENSION_common *d = o->tio.entity->tio.DIMENSION_LINEAR
                                       ? (const Dwg_DIMENSION_common *)o->tio.entity->tio.DIMENSION_LINEAR
@@ -1918,6 +2114,7 @@ static void add_dimension(Geom *g, const Dwg_Object *o) {
   default:  // ordinate: text only
     break;
   }
+  if (!angular) dim_prescaled(o, &v);
   dim_value(val, sizeof val, &v, d->act_measurement, angular);
   char *t = dim_text(o, d->user_text, val, prefix);
   double trot = d->text_rotation != 0 ? d->text_rotation : dim_readable(rot);
@@ -2380,7 +2577,8 @@ static char *geom_serialize(const Geom *g, Tables *t, size_t *size,
                   (uint32_t)g->texts.n, (uint32_t)pool.n,
                   (uint32_t)styles.n, (uint32_t)layers.n, (uint32_t)ltypes.n,
                   (uint32_t)dashes.n, (uint32_t)g->fills.n, (uint32_t)g->fpts.n,
-                  (uint32_t)g->hlines.n, n_ord, t->units, g->ox, g->oy, g->q};
+                  (uint32_t)g->hlines.n, n_ord, (uint32_t)g->dims.n, t->units,
+                  g->ox, g->oy, g->q};
   memcpy(&h.magic, &hv.magic, offsetof(UmgHeader, units) + sizeof h.units);
   h.ox = hv.ox, h.oy = hv.oy, h.q = hv.q;
   Vec st16[6];
@@ -2390,7 +2588,7 @@ static char *geom_serialize(const Geom *g, Tables *t, size_t *size,
   }
   const Vec *parts[] = {&g->lines, &g->arcs, &g->polys, &g->pts, &g->texts,
                         &g->fills, &g->fpts, &g->hlines, &fill_ord,
-                        &hline_ord, &g->hline_lod, &styles, &layers,
+                        &hline_ord, &g->hline_lod, &g->dims, &styles, &layers,
                         &ltypes, &dashes, &st16[0], &st16[1], &st16[2],
                         &st16[3], &st16[4], &st16[5], &pool};
   const int np = sizeof parts / sizeof *parts;

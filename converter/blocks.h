@@ -122,10 +122,14 @@ static Refs *refs_for(Blocks *s, const Dwg_Object_Entity *e) {
 // Without a *D block the dimension is drawn from its own data instead
 // (add_dimension), into model space or its owning block.
 static void blocks_add_dimension(Blocks *s, Geom *ms, const Dwg_Object *o) {
+  dim_record(ms, o);
   Refs *r = refs_for(s, o->tio.entity);
   uint64_t h = ref_handle(o->tio.entity->tio.DIMENSION_LINEAR->block);
 #ifdef UNIMOG_DIM_SELF  // test build: draw angular dimensions from their data
   if (o->fixedtype == DWG_TYPE_DIMENSION_ANG3PT || o->fixedtype == DWG_TYPE_DIMENSION_ANG2LN) h = 0;
+#endif
+#ifdef UNIMOG_DIM_SELF_ALL  // test build: every dimension from its data
+  h = 0;
 #endif
   if (r && !h) {
     const Dwg_Object_Entity *e = o->tio.entity;
