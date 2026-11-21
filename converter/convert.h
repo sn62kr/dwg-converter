@@ -72,6 +72,17 @@ static Xf xf_mul(Xf p, Xf q) {  // p after q
 
 static double xf_det(Xf m) { return m.a * m.d - m.b * m.c; }
 
+static Xf xf_inv(Xf m) {  // det != 0
+  double det = xf_det(m);
+  Xf r = {m.d / det, -m.b / det, -m.c / det, m.a / det, 0, 0};
+  r.tx = -(r.a * m.tx + r.b * m.ty), r.ty = -(r.c * m.tx + r.d * m.ty);
+  return r;
+}
+
+// 0: the model (as always). N >= 1: the N-th layout (-l N): its paper space,
+// with the model seen through each viewport (blocks.h, unimog_convert.c).
+static int g_layout;
+
 // Similarity (rotation + uniform scale, optionally mirrored): arcs stay arcs.
 static int xf_similar(Xf m) {
   double sx = hypot(m.a, m.c), sy = hypot(m.b, m.d);
@@ -89,6 +100,7 @@ static int xf_similar(Xf m) {
 #define COL_ACI 0x02000000u
 #define COL_BYBLOCK 0x03000000u
 #define COL_BG 0x04000000u  // WIPEOUT: background colour
+#define COL_BOLD 0x05000000u  // COL_TRUE drawn bold (UMG_RGB_BOLD)
 // Linetypes: LT_BYLAYER, LT_BYBLOCK, LT_CONT, else the LTYPE handle.
 #define LT_BYLAYER 0u
 #define LT_BYBLOCK 1u
@@ -1003,25 +1015,11 @@ static void add_solid(Geom *g, const Dwg_Entity_SOLID *s) {
 // WIPEOUT: a polygon in the background colour that hides the fills and
 // hatches before it in draw order. Clip vertices are image pixels with the
 // origin at the top-left (as ezdxf maps them); a WIPEOUT image is 1 x 1.
+static uint32_t image_outline(const Dwg_Entity_IMAGE *w, double **out);
+
 static void add_wipeout(Geom *g, const Dwg_Entity_WIPEOUT *w) {
-  double sx = w->image_size.x, sy = w->image_size.y;
-  BITCODE_2RD box[4] = {{-0.5, -0.5}, {sx - 0.5, -0.5}, {sx - 0.5, sy - 0.5},
-                        {-0.5, sy - 0.5}};
-  const BITCODE_2RD *v = box;
-  uint32_t n = 4;
-  if (w->clipping && w->num_clip_verts >= 3) {
-    v = w->clip_verts, n = w->num_clip_verts;
-  } else if (w->clipping && w->num_clip_verts == 2) {  // rectangle corners
-    const BITCODE_2RD *c = w->clip_verts;
-    box[0].x = box[3].x = c[0].x, box[1].x = box[2].x = c[1].x;
-    box[0].y = box[1].y = c[0].y, box[2].y = box[3].y = c[1].y;
-  }
-  double *xy = (double *)malloc(n * 2 * sizeof(double));
-  for (uint32_t i = 0; i < n; i++) {
-    double a = v[i].x + 0.5, b = sy - 0.5 - v[i].y;
-    xy[2 * i] = w->pt0.x + w->uvec.x * a + w->vvec.x * b;
-    xy[2 * i + 1] = w->pt0.y + w->uvec.y * a + w->vvec.y * b;
-  }
+  double *xy;
+  uint32_t n = image_outline((const Dwg_Entity_IMAGE *)w, &xy);  // same fields
   Vec tri = {NULL, 0, 0, 4};
   ec_triangulate(xy, n, NULL, 0, &tri);
   RawStyle k = g_styles.v[g->cur];
@@ -1995,7 +1993,7 @@ static int text_number(const char *s, double *out) {
 // words without a number are left out.
 static void dim_record(Geom *g, const Dwg_Object *o) {
   const Dwg_Object_Entity *e = o->tio.entity;
-  if (e->entmode != 2 || g->dims.n >= 200000) return;
+  if (e->entmode != 2 || g->dims.n >= 200000 || g_layout) return;
   int aligned = o->fixedtype == DWG_TYPE_DIMENSION_ALIGNED;
   if (o->fixedtype != DWG_TYPE_DIMENSION_LINEAR && !aligned) return;
   const Dwg_Entity_DIMENSION_LINEAR *l = e->tio.DIMENSION_LINEAR;  // same layout as ALIGNED
@@ -2133,6 +2131,82 @@ static void add_dimension(Geom *g, const Dwg_Object *o) {
 }
 
 // ---- entities -------------------------------------------------------------
+
+#include "acis.h"
+
+// REGION, 3DSOLID, BODY and the surface entities: the edges of their ACIS
+// model (acis.h). 0 when the model is not in the entity (R2013+ keeps it in
+// the data-storage section, which LibreDWG does not read) or has no edges.
+static unsigned long add_acis(Geom *g, const Dwg_Object *o) {
+  // All of them start with the same fields (_3DSOLID_FIELDS).
+  const Dwg_Entity_3DSOLID *s = o->tio.entity->tio._3DSOLID;
+  if (!s || s->acis_empty || !s->acis_data) return 0;
+  if (s->version == 2) return acis_edges(g, s->acis_data, s->sab_size, 1);
+  if (s->version == 1) return acis_edges(g, s->acis_data, strlen((const char *)s->acis_data), 0);
+  return 0;
+}
+
+// Corners of an IMAGE or WIPEOUT on the drawing: its clip boundary, or the
+// whole picture. Pixel coordinates run from the top left, half a pixel out.
+// Returns the corner count; *out is malloc'd (x, y pairs).
+static uint32_t image_outline(const Dwg_Entity_IMAGE *w, double **out) {
+  double sx = w->image_size.x, sy = w->image_size.y;
+  BITCODE_2RD box[4] = {{-0.5, -0.5}, {sx - 0.5, -0.5}, {sx - 0.5, sy - 0.5},
+                        {-0.5, sy - 0.5}};
+  const BITCODE_2RD *v = box;
+  uint32_t n = 4;
+  if (w->clipping && w->clip_verts && w->num_clip_verts >= 3) {
+    v = w->clip_verts, n = w->num_clip_verts;
+  } else if (w->clipping && w->clip_verts && w->num_clip_verts == 2) {  // rectangle corners
+    const BITCODE_2RD *c = w->clip_verts;
+    box[0].x = box[3].x = c[0].x, box[1].x = box[2].x = c[1].x;
+    box[0].y = box[1].y = c[0].y, box[2].y = box[3].y = c[1].y;
+  }
+  double *xy = (double *)malloc(n * 2 * sizeof(double));
+  for (uint32_t i = 0; i < n; i++) {
+    double a = v[i].x + 0.5, b = sy - 0.5 - v[i].y;
+    xy[2 * i] = w->pt0.x + w->uvec.x * a + w->vvec.x * b;
+    xy[2 * i + 1] = w->pt0.y + w->uvec.y * a + w->vvec.y * b;
+  }
+  *out = xy;
+  return n;
+}
+
+// IMAGE: the picture is a separate file the DWG only names, and a drawing
+// that arrives alone (KakaoTalk, mail) comes without it. Like AutoCAD with
+// the file missing: the frame, and the file's name inside so the reader
+// knows what belongs there. Still counted as not drawn (the picture is not).
+static void add_image(Geom *g, const Dwg_Object *o) {
+  const Dwg_Entity_IMAGE *w = o->tio.entity->tio.IMAGE;
+  double *xy;
+  uint32_t n = image_outline(w, &xy);
+  begin_poly(g, n, UMG_CLOSED | UMG_LTCONT);
+  for (uint32_t i = 0; i < n; i++) add_pt(g, XF_ID, xy[2 * i], xy[2 * i + 1], 0);
+  free(xy);
+  Dwg_Object *d = w->imagedef ? dwg_ref_object(o->parent, w->imagedef) : NULL;
+  char *u = d && d->fixedtype == DWG_TYPE_IMAGEDEF
+                ? dwg_utf8(o, d->tio.object->tio.IMAGEDEF->file_path) : NULL;
+  if (!u) return;
+  const char *nm = u;
+  for (const char *q = u; *q; q++)
+    if (*q == '/' || *q == '\\') nm = q + 1;
+  size_t len = strlen(nm), chars = 0;
+  for (size_t i = 0; i < len; i++) chars += ((unsigned char)nm[i] & 0xC0) != 0x80;
+  // Whole picture: W along u, H along v. The name in the middle, as wide as
+  // 60 % of the frame at most and a tenth of its height at most.
+  double W = hypot(w->uvec.x, w->uvec.y) * w->image_size.x;
+  double H = hypot(w->vvec.x, w->vvec.y) * w->image_size.y;
+  double h = fmin(H / 10, chars ? 0.6 * W / (double)chars : 0);
+  if (len && len < 256 && h > 0 && isfinite(h)) {
+    double cx = w->pt0.x + (w->uvec.x * w->image_size.x + w->vvec.x * w->image_size.y) / 2;
+    double cy = w->pt0.y + (w->uvec.y * w->image_size.x + w->vvec.y * w->image_size.y) / 2;
+    UmgText r = {0};
+    r.h = (float)h, r.rot = (float)atan2(w->uvec.y, w->uvec.x), r.wf = 1;
+    r.ha = 1, r.va = 2;  // centred on the middle
+    push_text(g, r, cx, cy, cx, cy, nm, (uint32_t)len);
+  }
+  free(u);
+}
 
 // Types whose geometry is fully contained in the object itself, so the
 // streaming decoder may free them right after conversion.
@@ -2306,6 +2380,26 @@ static void convert_entity(Geom *g, const Dwg_Object *o) {
   case DWG_TYPE_MULTILEADER:  // not streamed: its arrow blocks are resolved
     add_multileader(g, o);
     break;
+  case DWG_TYPE_IMAGE:
+    add_image(g, o);  // the frame and the file's name; the picture itself is not there
+    g->n_skipped++;
+    unsupported_tally(o->name);
+    break;
+  case DWG_TYPE_REGION: case DWG_TYPE__3DSOLID: case DWG_TYPE_BODY:
+  case DWG_TYPE_PLANESURFACE: case DWG_TYPE_EXTRUDEDSURFACE:
+  case DWG_TYPE_LOFTEDSURFACE: case DWG_TYPE_REVOLVEDSURFACE:
+  case DWG_TYPE_SWEPTSURFACE: case DWG_TYPE_NURBSURFACE:
+    if (add_acis(g, o)) break;
+    g->n_skipped++;
+    unsupported_tally(o->name);
+    break;
+  case DWG_TYPE_PROXY_ENTITY:
+    // Another program's object. Without stored graphics (Civil 3D state
+    // records, ...) AutoCAD shows nothing either: not something we left out.
+    if (!e->preview_exists || e->preview_size <= 8) break;
+    g->n_skipped++;
+    unsupported_tally(o->name);
+    break;
   default:
     g->n_skipped++;
     unsupported_tally(o->name);
@@ -2349,6 +2443,7 @@ static uint32_t color_rgb(uint32_t raw) {
   switch (raw & 0xff000000u) {
   case COL_BG: return UMG_RGB_BACKGROUND;
   case COL_TRUE: return raw & 0xffffff;
+  case COL_BOLD: return (raw & 0xffffff) | UMG_RGB_BOLD;
   case COL_ACI: return aci_rgb(raw & 0xff);
   default: return 0xffffff;
   }
@@ -2504,7 +2599,25 @@ static void ord_ranks(const Geom *g, Tables *t, Vec *fill_ord, Vec *hline_ord,
 // ---- UMG8 image -----------------------------------------------------------
 
 // Raw (uncompressed) UMG8 image of g with resolved styles and the tables.
-static char *geom_serialize(const Geom *g, Tables *t, size_t *size,
+// The cache as its parts in order (header first): written one after the
+// other through the compressor, so the whole uncompressed cache is never in
+// memory at once (it was the converter's peak: 330 MB for a 91 MB DWG).
+typedef struct {
+  UmgHeader h;
+  const void *p[32];
+  size_t len[32];
+  int n;
+  size_t total;
+  void *own[16];  // buffers made here, freed by serial_free
+  int nown;
+} Serial;
+
+static void serial_free(Serial *s) {
+  for (int i = 0; i < s->nown; i++) free(s->own[i]);
+  s->nown = 0;
+}
+
+static void geom_serialize(const Geom *g, Tables *t, Serial *out,
                             unsigned long *n_style_overflow) {
   if (!t->n_layers) {  // no layer table (should not happen): one layer "0"
     LayerInfo L = {0, LT_CONT, strdup("0"), 0xffffff, 0};
@@ -2592,17 +2705,14 @@ static char *geom_serialize(const Geom *g, Tables *t, size_t *size,
                         &ltypes, &dashes, &st16[0], &st16[1], &st16[2],
                         &st16[3], &st16[4], &st16[5], &pool};
   const int np = sizeof parts / sizeof *parts;
-  size_t n = sizeof h;
-  for (int i = 0; i < np; i++) n += parts[i]->n * parts[i]->elem;
-  char *raw = (char *)malloc(n), *w = raw;
-  memcpy(w, &h, sizeof h), w += sizeof h;
+  memset(out, 0, sizeof *out);
+  out->h = h;
+  out->p[0] = &out->h, out->len[0] = sizeof h, out->n = 1, out->total = sizeof h;
   for (int i = 0; i < np; i++) {
-    if (parts[i]->n) memcpy(w, parts[i]->p, parts[i]->n * parts[i]->elem);
-    w += parts[i]->n * parts[i]->elem;
+    out->p[out->n] = parts[i]->p, out->len[out->n] = parts[i]->n * parts[i]->elem;
+    out->total += out->len[out->n++];
   }
-  *size = n;
-  for (int a = 0; a < 6; a++) free(idx[a]);
-  free(styles.p), free(pool.p), free(layers.p), free(ltypes.p), free(dashes.p);
-  free(fill_ord.p), free(hline_ord.p);
-  return raw;
+  for (int a = 0; a < 6; a++) out->own[out->nown++] = idx[a];
+  void *mine[] = {styles.p, pool.p, layers.p, ltypes.p, dashes.p, fill_ord.p, hline_ord.p};
+  for (size_t i = 0; i < sizeof mine / sizeof *mine; i++) out->own[out->nown++] = mine[i];
 }

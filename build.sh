@@ -43,6 +43,6 @@ fi
 INC="-Iconverter -Icore -I$B/libredwg-0.14/include -I$O/src -I$Z"
 if [ "$T" = android ]; then PIE="-fPIE -pie"; else PIE=; fi
 "$CC" -O2 $PIE -Wno-unused-function -o "$OUTBIN" converter/unimog_convert.c $INC \
-  "$O/src/.libs/libredwg.a" "$ZO/libzstd.a" -lm
+  "$O/src/.libs/libredwg.a" "$ZO/libzstd.a" -lz -lm
 [ "$T" = android ] && "$TC/bin/llvm-strip" "$OUTBIN"
 ls -l "$OUTBIN"

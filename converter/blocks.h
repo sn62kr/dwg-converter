@@ -18,6 +18,8 @@ typedef struct {
   uint64_t handle;  // of the INSERT / DIMENSION (draw order)
   double *clip;    // XCLIP boundary in block coordinates (x, y pairs), or NULL
   uint32_t nclip;
+  uint64_t *hide;  // a viewport's own frozen layers (handles, sorted), or NULL
+  uint32_t nhide;
 } Ref;
 
 typedef struct {
@@ -37,7 +39,7 @@ static Ref *refs_push(Refs *r, uint64_t block, Xf xf, uint32_t style,
 }
 
 static void refs_free(Refs *r) {
-  for (size_t k = 0; k < r->n; k++) free(r->v[k].clip);
+  for (size_t k = 0; k < r->n; k++) free(r->v[k].clip), free(r->v[k].hide);
   free(r->v);
 }
 
@@ -109,12 +111,26 @@ static int is_dimension(const Dwg_Object *o) {
   }
 }
 
+// For a layout (g_layout) model space and the active paper space are kept as
+// two more blocks under these keys (their entities name no owner; the other
+// layouts' *Paper_SpaceN blocks are ordinary blocks already). The layout is
+// then put together from them (layout_roots).
+#define MS_KEY (UINT64_MAX - 1)
+#define PS_KEY (UINT64_MAX - 2)
+
 // Where a reference found in entity e goes: model space roots, or the kids of
-// its owning block. Paper space is dropped.
+// its owning block. Paper space is dropped (unless a layout is wanted).
 static Refs *refs_for(Blocks *s, const Dwg_Object_Entity *e) {
-  if (e->entmode == 2) return &s->roots;
-  if (e->entmode == 1) return NULL;
+  if (e->entmode == 2) return g_layout ? &block_get(s, MS_KEY)->kids : &s->roots;
+  if (e->entmode == 1) return g_layout ? &block_get(s, PS_KEY)->kids : NULL;
   return &block_get(s, ref_handle(e->ownerhandle))->kids;
+}
+
+// Where the primitives of entity e go, the same way; NULL = dropped.
+static Geom *geom_for(Blocks *s, Geom *ms, const Dwg_Object_Entity *e) {
+  if (e->entmode == 2) return g_layout ? &block_get(s, MS_KEY)->geom : ms;
+  if (e->entmode == 1) return g_layout ? &block_get(s, PS_KEY)->geom : NULL;
+  return &block_get(s, ref_handle(e->ownerhandle))->geom;
 }
 
 // DIMENSION geometry lives in an anonymous *D block already in world
@@ -133,7 +149,7 @@ static void blocks_add_dimension(Blocks *s, Geom *ms, const Dwg_Object *o) {
 #endif
   if (r && !h) {
     const Dwg_Object_Entity *e = o->tio.entity;
-    Geom *g = e->entmode == 2 ? ms : &block_get(s, ref_handle(e->ownerhandle))->geom;
+    Geom *g = geom_for(s, ms, e);
     g->cur = entity_style(e);
     OrdKey k = {g->model ? o->handle.value : 0, g->model ? 0 : o->handle.value};
     g->ord = k;
@@ -239,9 +255,8 @@ static void blocks_add_attrib(Blocks *s, Geom *ms, const Dwg_Object *o) {
     return;
   }
   Dwg_Object_Entity *ie = ins->tio.entity;
-  if (ie->entmode == 2) convert_attrib(ms, o);
-  else if (ie->entmode != 1)
-    convert_attrib(&block_get(s, ref_handle(ie->ownerhandle))->geom, o);
+  Geom *g = geom_for(s, ms, ie);
+  if (g) convert_attrib(g, o);
 }
 
 static void blocks_set_base(Blocks *s, const Dwg_Object *o) {
@@ -380,6 +395,20 @@ static size_t poly_cut(const double *a, size_t n, const double *r, uint32_t rn,
   return m;
 }
 
+// Layers frozen in the viewport being emitted (a layout's root reference):
+// what ends up on one of them is left out, a block reference with all it holds.
+static const uint64_t *g_hide;
+static uint32_t g_nhide;
+
+static int cmp_u64(const void *a, const void *b) {
+  uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+  return x < y ? -1 : x > y;
+}
+
+static int layer_hidden(uint64_t layer) {
+  return g_nhide && bsearch(&layer, g_hide, g_nhide, sizeof(uint64_t), cmp_u64) != NULL;
+}
+
 // xf maps this block's coordinates, after removing its base point, to world;
 // style is the (already composed) raw style of the reference placing it.
 // Draw order: root is the model-space reference; below the first level
@@ -414,12 +443,14 @@ static void emit_block(Blocks *s, Geom *out, uint64_t h, Xf xf, uint32_t style,
     OrdKey k_ = {root, depth ? inner : ((const OrdKey *)g->keys.p)[i].inner}; \
     out->ord = k_;                                                        \
   } while (0)
+#define HID() (g_nhide && layer_hidden(g_styles.v[out->cur].layer))
 #define MX(x, y) (m.a * (x) + m.b * (y) + m.tx)
 #define MY(x, y) (m.c * (x) + m.d * (y) + m.ty)
   Vec pts = {NULL, 0, 0, 2 * sizeof(double)};
   const UmgLine *l = (const UmgLine *)g->lines.p;
   for (size_t i = 0; i < g->lines.n; i++, l++) {
     STYLE(line_st, i);
+    if (HID()) continue;
     double x1 = WX(g, l->x1), y1 = WY(g, l->y1), x2 = WX(g, l->x2), y2 = WY(g, l->y2);
     if (clipped)
       clips_segment(&cs, MX(x1, y1), MY(x1, y1), MX(x2, y2), MY(x2, y2), emit_line, out);
@@ -430,6 +461,7 @@ static void emit_block(Blocks *s, Geom *out, uint64_t h, Xf xf, uint32_t style,
   const double lod_scale = sqrt(fabs(xf_det(m)));
   for (size_t i = 0; i < g->hlines.n; i++, l++) {
     STYLE(hline_st, i);
+    if (HID()) continue;
     ORD(hline_key, i);
     out->lod = (float)(((const float *)g->hline_lod.p)[i] * lod_scale);
     double x1 = WX(g, l->x1), y1 = WY(g, l->y1), x2 = WX(g, l->x2), y2 = WY(g, l->y2);
@@ -444,6 +476,7 @@ static void emit_block(Blocks *s, Geom *out, uint64_t h, Xf xf, uint32_t style,
   const UmgArc *a = (const UmgArc *)g->arcs.p;
   for (size_t i = 0; i < g->arcs.n; i++, a++) {
     STYLE(arc_st, i);
+    if (HID()) continue;
     double cx = WX(g, a->cx), cy = WY(g, a->cy), r = a->r * g->q;
     if (clipped) {
       double sw = a->a1 - a->a0;
@@ -457,6 +490,7 @@ static void emit_block(Blocks *s, Geom *out, uint64_t h, Xf xf, uint32_t style,
   for (size_t i = 0, p0 = 0; i < g->polys.n; i++) {
     STYLE(poly_st, i);
     uint32_t head = ((const uint32_t *)g->polys.p)[i], cnt = head & UMG_COUNT;
+    if (HID()) { p0 += cnt; continue; }
     int whole = 1;
     if (clipped && cnt >= 2) {
       const UmgPt *v = (const UmgPt *)g->pts.p + p0;
@@ -490,6 +524,7 @@ static void emit_block(Blocks *s, Geom *out, uint64_t h, Xf xf, uint32_t style,
     STYLE(fill_st, i);
     ORD(fill_key, i);
     uint32_t nv = ((const uint32_t *)g->fills.p)[i];
+    if (HID()) { f0 += nv; continue; }
     if (!clipped) {
       copy_fill(out, m, g, i, f0);
     } else {  // triangle by triangle
@@ -536,6 +571,7 @@ static void emit_block(Blocks *s, Geom *out, uint64_t h, Xf xf, uint32_t style,
   const UmgText *t = (const UmgText *)g->texts.p;
   for (size_t i = 0; i < g->texts.n; i++) {
     STYLE(text_st, i);
+    if (HID()) continue;
     UmgText r = t[i];
     double x = WX(g, r.x), y = WY(g, r.y), x2 = WX(g, r.x2), y2 = WY(g, r.y2);
     if (clipped && !clips_inside(&cs, MX(x, y), MY(x, y))) continue;
@@ -550,11 +586,13 @@ static void emit_block(Blocks *s, Geom *out, uint64_t h, Xf xf, uint32_t style,
     // The nested reference is itself an entity of this block. Its pattern
     // scale is applied by the full transform when its primitives are emitted.
     uint32_t st = style_compose(f->style, style, s->layer0, XF_ID);
+    if (g_nhide && layer_hidden(g_styles.v[st].layer)) continue;
     emit_block(s, out, f->block, xf_mul(m, f->xf), st, depth + 1, root,
                depth ? inner : f->handle, f->clip, f->nclip, &cs);
   }
   free(own);
 #undef STYLE
+#undef HID
 #undef ORD
 #undef MX
 #undef MY
@@ -564,8 +602,10 @@ static void blocks_expand(Blocks *s, Geom *out) {
   Clips none = {0};
   for (size_t k = 0; k < s->roots.n; k++) {
     const Ref *f = &s->roots.v[k];
+    g_hide = f->hide, g_nhide = f->nhide;
     emit_block(s, out, f->block, f->xf, f->style, 0, f->handle, 0, f->clip,
                f->nclip, &none);
+    g_hide = NULL, g_nhide = 0;
   }
 }
 

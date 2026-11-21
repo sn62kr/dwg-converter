@@ -94,6 +94,8 @@ typedef struct {
 
 // UmgStyle.rgb flag: WIPEOUT, filled with the background colour.
 #define UMG_RGB_BACKGROUND 0x01000000u
+// UmgStyle.rgb flag: lines drawn 3 px wide (판 비교: what changed, D117).
+#define UMG_RGB_BOLD 0x02000000u
 
 #define UMG_LAYER_OFF 1u
 #define UMG_LAYER_FROZEN 2u

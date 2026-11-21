@@ -1,6 +1,6 @@
 --- libredwg-0.14/src/decode.c
 +++ libredwg-0.14/src/decode.c
-@@ -2473,6 +2473,84 @@
+@@ -2473,6 +2473,108 @@
  
  /* R2004, 2010+ Handles Section
   */
@@ -26,6 +26,30 @@
 +  stream_ud = userdata;
 +  stream_have_last = 0;
 +  stream_consumed = 0;
++}
++
++/* UNIMOG streaming patch, DXF: the DXF reader offers each entity of its
++   ENTITIES section once it is complete (owner and entmode set), before it
++   is linked to its block header. A consumed entity is freed and its slot
++   reused as in the DWG reader, and its handle is taken out of object_map
++   (a later lookup finds nothing rather than whatever reuses the slot). Its
++   refs stay: the DXF reader shares refs between objects (dwg_add_handleref
++   returns an existing one), so they cannot be freed here. */
++EXPORT int
++dwg_stream_offer (Dwg_Data *restrict dwg, Dwg_Object *restrict obj)
++{
++  if (!stream_cb || !dwg->num_objects
++      || obj != &dwg->object[dwg->num_objects - 1])
++    return 0;
++  if (!stream_cb (dwg, obj, stream_ud))
++    return 0;
++  if (obj->handle.value && dwg->object_map)
++    hash_set (dwg->object_map, obj->handle.value, (uint64_t)(BITCODE_BL)-1);
++  dwg_free_object (obj);
++  memset (obj, 0, sizeof (Dwg_Object));
++  dwg->num_objects--;
++  stream_consumed++;
++  return 1;
 +}
 +
 +EXPORT unsigned long
@@ -85,7 +109,25 @@
  static int
  read_2004_section_handles (Bit_Chain *restrict dat, Dwg_Data *restrict dwg)
  {
-@@ -2545,18 +2623,25 @@
+@@ -2516,6 +2618,17 @@
+       fclose (fp);
+     }
+ #endif
++  // UNIMOG: streaming reads this section after the others, and nothing reads the file
++  // data after these two sections are decompressed: free it now rather than
++  // after decoding (a file's size less at the peak; dwg_read_file's free of
++  // the NULL chain is a no-op).
++  if (stream_cb && dat->chain)
++    {
++      free (dat->chain);
++      dat->chain = NULL;
++      dat->size = 0;
++      dat->byte = 0;
++    }
+ 
+   endpos = hdl_dat.byte + hdl_dat.size;
+   dwg->num_objects = 0;
+@@ -2545,18 +2658,25 @@
          }
  
        last_offset = 0;
@@ -114,7 +156,7 @@
  
            oldpos = hdl_dat.byte;
            // the offset from the previous handle. default: 1, unsigned
-@@ -2597,6 +2682,7 @@
+@@ -2597,6 +2717,7 @@
            if (added > 0)
              error |= added;
            // else re-allocated
@@ -122,7 +164,7 @@
            // we don't stop encoding on single errors, but we sum them all up
            // as combined bitmask
          }
-@@ -2634,6 +2720,7 @@
+@@ -2634,6 +2755,7 @@
      }
    while (section_size > 2);
  
@@ -130,21 +172,51 @@
    free (hdl_dat.chain);
    free (obj_dat.chain);
    return error;
-@@ -3548,6 +3635,13 @@
-         while (section_type != 0x41630e3b && dat->byte > 0x120);
+@@ -3321,6 +3443,12 @@
+ /* datastorage section. Optional, since r2013
+    Contains the SAB binary ACIS data, version 2
+  */
++// UNIMOG: when streaming, the AcDs section is decompressed before the
++// objects (the file data is gone after them) and parsed after them (it puts
++// SAB data into the 3DSOLIDs by handle).
++static Bit_Chain stream_acds = { 0 };
++static int stream_acds_error = 0;
++
+ static int
+ read_2004_section_acds (Bit_Chain *restrict dat, Dwg_Data *restrict dwg)
+ {
+@@ -3329,7 +3457,15 @@
+   const char *secname = "AcDsPrototype_1b";
+ 
+   // compressed, pagesize 0x7400, type 13
+-  error = read_2004_compressed_section (dat, dwg, &sec_dat, SECTION_ACDS);
++  if (stream_acds.chain || stream_acds_error)
++    {
++      sec_dat = stream_acds;
++      error = stream_acds_error;
++      memset (&stream_acds, 0, sizeof (stream_acds));
++      stream_acds_error = 0;
++    }
++  else
++    error = read_2004_compressed_section (dat, dwg, &sec_dat, SECTION_ACDS);
+   if (error >= DWG_ERR_CRITICAL || !sec_dat.chain)
+     {
+       LOG_INFO ("%s section not found\n", secname);
+@@ -3549,6 +3685,13 @@
          if (section_type != 0x41630e3b)
            LOG_INFO ("Not found\n");
-+      }
+       }
 +    // unimog: a damaged section_map_address can still leave the page header
 +    // (0x114 bytes from start) past the end of the file (fuzzing).
 +    if (start + 0x114 > dat->size)
 +      {
 +        LOG_ERROR ("System Section Page Map @0x%zx past the end", start);
 +        return DWG_ERR_SECTIONNOTFOUND;
-       }
++      }
      map = &dat->chain[start];
      LOG_INSANE ("section_map_address: 0x%zx + 0x100:\n", start);
-@@ -3572,6 +3666,12 @@
+     LOG_INSANE_TF (map, 0x100);
+@@ -3572,6 +3715,12 @@
      checksum1 = dwg_section_page_checksum (0, dat, 20, true);
      // now the compressed buffer, not the header. not skipping the checksum
      dat->byte = start + 0x114;
@@ -157,7 +229,34 @@
      checksum2 = dwg_section_page_checksum (checksum1, dat,
                                             _obj->comp_data_size, false);
      LOG_TRACE ("checksum => 0x%08x with calculated seed 0x%08x\n",
-@@ -3953,6 +4053,16 @@
+@@ -3666,7 +3815,11 @@
+   if (dwg->header.summaryinfo_address)
+     error |= read_2004_section_summary (dat, dwg);
+   error |= read_2004_section_classes (dat, dwg);
+-  error |= read_2004_section_handles (dat, dwg);
++  // UNIMOG: when streaming the objects come after the other sections (AcDs
++  // decompressed before them, parsed after): once their section and the
++  // handles are decompressed the file data is freed (see there).
++  if (!stream_cb)
++    error |= read_2004_section_handles (dat, dwg);
+   error |= read_2004_section_auxheader (dat, dwg);
+   if (dwg->header.thumbnail_address)
+     error |= read_2004_section_preview (dat, dwg);
+@@ -3680,6 +3833,13 @@
+   if (dwg->header.vbaproj_address)
+     error |= read_2004_section_vbaproject (dat, dwg);
+   // error |= read_2004_section_signature (dat, dwg);
++  if (stream_cb)
++    {
++      stream_acds_error = read_2004_compressed_section (dat, dwg, &stream_acds, SECTION_ACDS);
++      if (!stream_acds.chain && !stream_acds_error)
++        stream_acds_error = DWG_ERR_SECTIONNOTFOUND;
++      error |= read_2004_section_handles (dat, dwg);
++    }
+   error |= read_2004_section_acds (dat, dwg);
+ 
+   /* Clean up. XXX? Need this to write the sections, at least the name and
+@@ -3953,6 +4113,16 @@
      }
    LOG_POS
    return 0;
@@ -174,10 +273,12 @@
  }
  
  /* for objects and entities */
-@@ -3998,6 +4108,21 @@
+@@ -3996,6 +4166,21 @@
+           LOG_ERROR ("Invalid EED size " FORMAT_BS " > %u", size, _obj->size);
+           obj->num_eed = idx;
            return DWG_ERR_INVALIDEED;
-         }
- 
++        }
++
 +      // UNIMOG: skip the data, keeping the position exactly as the
 +      // "No EED handle" path below does. MLEADERSTYLE reads its version
 +      // here; dimensions keep their per-dimension style overrides (DSTYLE).
@@ -191,12 +292,10 @@
 +          sav_byte = dat->byte; // as the full path: start of the data
 +          dat->byte += size;
 +          continue; // idx stays 0: num_eed must match the NULL eed array
-+        }
-+
+         }
+ 
        obj->num_eed = idx + 1;
-       if (idx) /* just extend by one. not in chunks for now */
-         {
-@@ -4594,7 +4719,11 @@
+@@ -4594,7 +4779,11 @@
                                 * sizeof (Dwg_Object_Ref *));
        memset (&dwg->object_ref[dwg->num_object_refs], 0,
                REFS_PER_REALLOC * sizeof (Dwg_Object_Ref *));
@@ -209,7 +308,7 @@
        LOG_TRACE ("REALLOC dwg->object_ref vector to %u\n",
                   dwg->num_object_refs + REFS_PER_REALLOC);
      }
-@@ -5824,7 +5953,13 @@
+@@ -5824,7 +6013,13 @@
          }
      }
  
@@ -224,6 +323,57 @@
      { // empty only with UNKNOWN
        LOG_HANDLE (" object_map{" FORMAT_HV "} = %lu\n", obj->handle.value,
                    (unsigned long)num);
+@@ -5971,10 +6166,17 @@
+  * order). With mips32 -O2 inline would fail.
+  */
+ static int
+-ref_after (const Dwg_Object_Ref *restrict r1,
++ref_after (const Dwg_Data *dwg, const Dwg_Object_Ref *restrict r1,
+            const Dwg_Object_Ref *restrict r2)
+ {
+-  if (!r1 || !r2 || !r1->obj || !r2->obj)
++  // unimog: a ref's cached obj can point into the object array from before
++  // a realloc (R2007 files: the array grows while objects are read) - only
++  // compare objects inside the current array.
++  uintptr_t a = (uintptr_t)dwg->object,
++            e = (uintptr_t)(dwg->object + dwg->num_objects);
++  if (!r1 || !r2 || !r1->obj || !r2->obj || !dwg->object
++      || (uintptr_t)r1->obj < a || (uintptr_t)r1->obj >= e
++      || (uintptr_t)r2->obj < a || (uintptr_t)r2->obj >= e)
+     return 0;
+   return r1->obj->index >= r2->obj->index ? 1 : 0;
+ }
+@@ -6079,8 +6281,8 @@
+       Dwg_Object_Ref *restrict first_vertex = _obj->first_vertex;
+       Dwg_Object_Ref *restrict last_vertex = _obj->last_vertex;
+       Dwg_Object_Ref *restrict seqend = _obj->seqend;
+-      if (ref_after (first_vertex, last_vertex)
+-          || ref_after (last_vertex, seqend))
++      if (ref_after (dwg, first_vertex, last_vertex)
++          || ref_after (dwg, last_vertex, seqend))
+         {
+           LOG_TRACE ("unsorted POLYLINE VERTEX SEQEND\n");
+           return 0;
+@@ -6091,7 +6293,7 @@
+       BITCODE_BL i = 1;
+       Dwg_Object_Ref *restrict first_vertex = _obj->vertex[0];
+       Dwg_Object_Ref *restrict seqend = _obj->seqend;
+-      if (ref_after (first_vertex, seqend))
++      if (ref_after (dwg, first_vertex, seqend))
+         {
+           /* r2010+ often mix up the hdlstream offset:
+              layer,vertex*,seqend. check the types then also */
+@@ -6112,8 +6314,8 @@
+         }
+       for (; i < _obj->num_owned; i++)
+         {
+-          if (ref_after (first_vertex, _obj->vertex[i])
+-              || ref_after (_obj->vertex[i], seqend))
++          if (ref_after (dwg, first_vertex, _obj->vertex[i])
++              || ref_after (dwg, _obj->vertex[i], seqend))
+             {
+               LOG_TRACE ("unsorted POLYLINE VERTEX SEQEND\n");
+               return 0;
 --- libredwg-0.14/src/decode_r2007.c
 +++ libredwg-0.14/src/decode_r2007.c
 @@ -788,6 +788,7 @@
@@ -332,15 +482,17 @@
  int obj_handle_stream (Bit_Chain *restrict dat, Dwg_Object *restrict obj,
 --- libredwg-0.14/include/dwg.h
 +++ libredwg-0.14/include/dwg.h
-@@ -11507,6 +11507,20 @@
- /*--------------------------------------------------
+@@ -11508,6 +11508,23 @@
   * Exported Functions
   */
-+
+ 
 +/* UNIMOG streaming patch: return non-zero from the callback to consume
 +   (free) the just-decoded object. R2004+ object stream only. */
 +typedef int (*dwg_stream_cb) (Dwg_Data *dwg, Dwg_Object *obj, void *userdata);
 +EXPORT void dwg_set_stream_callback (dwg_stream_cb cb, void *userdata);
++/* UNIMOG streaming patch, DXF: offers the last object read; 1 = consumed
++   (freed, its slot reused). */
++EXPORT int dwg_stream_offer (Dwg_Data *dwg, Dwg_Object *obj);
 +/* UNIMOG patch: don't decode extended entity data (EED) at all. */
 +EXPORT void dwg_set_skip_eed (int on);
 +EXPORT unsigned long dwg_stream_consumed (void);
@@ -350,9 +502,10 @@
 +EXPORT void dwg_set_before_decode (void (*cb) (void *), void *arg);
 +/* UNIMOG patch: DXF objects left out because they could not be read. */
 +EXPORT unsigned long dxf_broken_count (void);
- 
++
  EXPORT int dwg_read_file (const char *restrict filename,
                            Dwg_Data *restrict dwg);
+ EXPORT int dxf_read_file (const char *restrict filename,
 --- libredwg-0.14/src/codepages.c
 +++ libredwg-0.14/src/codepages.c
 @@ -307,11 +307,13 @@
@@ -391,7 +544,24 @@
  }
  
  /** dwg_read_file
-@@ -298,6 +308,8 @@
+@@ -239,6 +249,8 @@
+  * everything in dwg is cleared
+  * and then either read from dat, or set to a default.
+  */
++static void umg_reset_search_caches (void); // UNIMOG patch, defined below
++
+ EXPORT int
+ dwg_read_file (const char *restrict filename, Dwg_Data *restrict dwg)
+ {
+@@ -250,6 +262,7 @@
+   loglevel = dwg->opts & DWG_OPTS_LOGLEVEL;
+   memset (dwg, 0, sizeof (Dwg_Data));
+   dwg->opts = loglevel;
++  umg_reset_search_caches (); // UNIMOG patch
+ 
+   if (strEQc (filename, "-"))
+     {
+@@ -298,6 +311,8 @@
          return error;
      }
    fclose (fp);
@@ -400,7 +570,15 @@
  
    /* Decode the dwg structure */
    error = dwg_decode (&bit_chain, dwg);
-@@ -387,6 +399,8 @@
+@@ -339,6 +354,7 @@
+   Dwg_Version_Type version;
+ 
+   loglevel = dwg->opts & DWG_OPTS_LOGLEVEL;
++  umg_reset_search_caches (); // UNIMOG patch
+ 
+   if (!filename || stat (filename, &attrib))
+     {
+@@ -387,6 +403,8 @@
  
    size = fread (dat.chain, sizeof (char), dat.size, fp);
    fclose (fp);
@@ -409,7 +587,7 @@
    if (size != dat.size)
      {
        LOG_ERROR ("Could not read the entire file (%" PRIuSIZE
-@@ -847,6 +861,17 @@
+@@ -847,6 +865,17 @@
    return &dwg->object[obj->index + 1];
  }
  
@@ -427,7 +605,7 @@
  /**
   * Find an object given its handle
   */
-@@ -857,6 +882,8 @@
+@@ -857,6 +886,8 @@
      return NULL;
    if (dwg->dirty_refs)
      dwg_resolve_objectrefs_silent (dwg);
@@ -436,7 +614,7 @@
    if (ref->obj && !dwg->dirty_refs)
      {
        if (ref->obj->handle.value
-@@ -896,7 +923,7 @@
+@@ -896,7 +927,7 @@
  dwg_ref_object_relative (Dwg_Data *restrict dwg, Dwg_Object_Ref *restrict ref,
                           const Dwg_Object *restrict obj)
  {
@@ -445,7 +623,7 @@
      return ref->obj;
    if (dwg_resolve_handleref (ref, obj))
      {
-@@ -972,7 +999,7 @@
+@@ -972,7 +1003,7 @@
      return NULL;
    if (dwg->dirty_refs)
      dwg_resolve_objectrefs_silent (dwg);
@@ -454,7 +632,95 @@
      return ref->obj;
    if ((ref->handleref.code < 6
         && dwg_resolve_handleref ((Dwg_Object_Ref *)ref, NULL))
-@@ -3973,125 +4000,124 @@
+@@ -2292,16 +2323,53 @@
+ 
+ // Not checking the header_vars entry, only searching the objects
+ // Returning a hardowner ref (code 3) to it, as stored in header_vars.
++// UNIMOG patch: a DXF without a TABLES section (or without one of its
++// tables) asks for the missing control once per entity, and every time all
++// objects read so far were compared by name; so does dwg_next_handle with
++// every reference (a million lines: many minutes). Both now remember how far
++// they have looked. Reset when a file is read (dxf_read_file, dwg_read_file).
++#define UMG_TC_N 16
++static struct
++{
++  char name[28];
++  BITCODE_BL scanned; // objects before this one are not it
++} umg_tc[UMG_TC_N];
++static BITCODE_BL umg_nh_refs;  // references already looked at
++static BITCODE_RLL umg_nh_max;  // the highest of them
++
++static void
++umg_reset_search_caches (void)
++{
++  memset (umg_tc, 0, sizeof umg_tc);
++  umg_nh_refs = 0, umg_nh_max = 0;
++}
++
+ EXPORT BITCODE_H
+ dwg_find_table_control (Dwg_Data *restrict dwg, const char *restrict table)
+ {
+-  BITCODE_BL i;
++  BITCODE_BL i = 0;
++  int slot = -1;
+   loglevel = dwg->opts & DWG_OPTS_LOGLEVEL;
+-  for (i = 0; i < dwg->num_objects; i++)
++  if (table && strlen (table) < sizeof umg_tc[0].name)
++    for (int k = 0; k < UMG_TC_N; k++)
++      {
++        if (!umg_tc[k].name[0])
++          strcpy (umg_tc[k].name, table);
++        if (strEQ (umg_tc[k].name, table))
++          {
++            slot = k;
++            break;
++          }
++      }
++  if (slot >= 0 && umg_tc[slot].scanned <= dwg->num_objects)
++    i = umg_tc[slot].scanned;
++  for (; i < dwg->num_objects; i++)
+     {
+       if (dwg->object[i].name && strEQ (dwg->object[i].name, table))
+         {
+           Dwg_Handle *hdl = &dwg->object[i].handle;
++          if (slot >= 0)
++            umg_tc[slot].scanned = i; // found: the next search starts here
+           if (hdl->value)
+             return dwg_add_handleref (dwg, 3, hdl->value, NULL);
+           else
+@@ -2314,6 +2382,8 @@
+             }
+         }
+     }
++  if (slot >= 0)
++    umg_tc[slot].scanned = dwg->num_objects; // UNIMOG patch: not among these
+   // if we haven't read all objects yet, ignore this error
+   LOG_TRACE ("dwg_find_table_control: table control object %s not found\n",
+              table);
+@@ -3449,12 +3519,19 @@
+     }
+   // compare against relative handles (deleted and purged?)
+   LOG_INSANE ("compute HANDSEED " FORMAT_HV, seed);
+-  for (BITCODE_BL i = 0; i < dwg->num_object_refs; i++)
++  // UNIMOG patch: only the references added since the last call (see
++  // umg_reset_search_caches); the highest of the earlier ones is kept.
++  if (umg_nh_refs > dwg->num_object_refs)
++    umg_nh_refs = 0, umg_nh_max = 0;
++  for (BITCODE_BL i = umg_nh_refs; i < dwg->num_object_refs; i++)
+     {
+       Dwg_Object_Ref *ref = dwg->object_ref[i];
+-      if (ref && ref->absolute_ref > seed)
+-        seed = ref->absolute_ref;
++      if (ref && ref->absolute_ref > umg_nh_max)
++        umg_nh_max = ref->absolute_ref;
+     }
++  umg_nh_refs = dwg->num_object_refs;
++  if (umg_nh_max > seed)
++    seed = umg_nh_max;
+   LOG_INSANE (" => " FORMAT_HV "\n", seed + 1);
+   return seed + 1;
+ }
+@@ -3973,125 +4050,124 @@
    return pKey->absolute_ref > (*ppR)->absolute_ref    ? 1
           : pKey->absolute_ref == (*ppR)->absolute_ref ? 0
                                                        : -1;
@@ -472,8 +738,8 @@
 +  while (c < 2 * (size_t)n + 2)
 +    c <<= 1;
 +  return c;
-+}
-+
+ }
+ 
 +static size_t
 +ref_hash_at (BITCODE_RC code, BITCODE_RLL absref, size_t cap)
 +{
@@ -489,8 +755,8 @@
 +  while (t[i])
 +    i = (i + 1) & (cap - 1);
 +  t[i] = ref;
- }
- 
++}
++
  void
  ordered_ref_add (Dwg_Data *dwg, Dwg_Object_Ref *ref)
  {
@@ -509,6 +775,15 @@
    if ((BITCODE_BL)-1 == dwg->num_object_ordered_refs)
 -    {
 -      return;
+-    }
+-  if (0 == dwg->num_object_ordered_refs)
+-    {
+-      dwg->object_ordered_ref = (Dwg_Object_Ref **)calloc (
+-          REFS_PER_REALLOC, sizeof (Dwg_Object_Ref *));
+-    }
+-  else
+-    {
+-      if (0 == (dwg->num_object_ordered_refs % REFS_PER_REALLOC))
 +    return;
 +  cap = ref_hash_cap (dwg->num_object_ordered_refs);
 +  if (dwg->object_ordered_ref)  // keep the first one (look in the table only:
@@ -516,34 +791,6 @@
 +      size_t i = ref_hash_at (ref->handleref.code, ref->absolute_ref, cap);
 +      Dwg_Object_Ref *r;
 +      while ((r = dwg->object_ordered_ref[i]) != NULL)
-+        {
-+          if (r->handleref.code == ref->handleref.code
-+              && r->absolute_ref == ref->absolute_ref)
-+            return;
-+          i = (i + 1) & (cap - 1);
-+        }
-     }
--  if (0 == dwg->num_object_ordered_refs)
-+  newcap = ref_hash_cap (dwg->num_object_ordered_refs + 1);
-+  if (!dwg->object_ordered_ref)
-     {
--      dwg->object_ordered_ref = (Dwg_Object_Ref **)calloc (
--          REFS_PER_REALLOC, sizeof (Dwg_Object_Ref *));
-+      dwg->object_ordered_ref
-+          = (Dwg_Object_Ref **)calloc (cap, sizeof (Dwg_Object_Ref *));
-+      if (!dwg->object_ordered_ref)
-+        {
-+          dwg->num_object_ordered_refs = (BITCODE_BL)-1;
-+          return;
-+        }
-     }
--  else
-+  if (newcap != cap)
-     {
--      if (0 == (dwg->num_object_ordered_refs % REFS_PER_REALLOC))
-+      Dwg_Object_Ref **t
-+          = (Dwg_Object_Ref **)calloc (newcap, sizeof (Dwg_Object_Ref *));
-+      if (!t)
          {
 -          Dwg_Object_Ref **pNew = (Dwg_Object_Ref **)realloc (
 -              dwg->object_ordered_ref,
@@ -566,38 +813,55 @@
 -              memset (&dwg->object_ordered_ref[dwg->num_object_ordered_refs],
 -                      0, REFS_PER_REALLOC * sizeof (Dwg_Object_Ref *));
 -            }
-+          free (dwg->object_ordered_ref);
-+          dwg->object_ordered_ref = NULL;
-+          dwg->num_object_ordered_refs = (BITCODE_BL)-1;
-+          return;
++          if (r->handleref.code == ref->handleref.code
++              && r->absolute_ref == ref->absolute_ref)
++            return;
++          i = (i + 1) & (cap - 1);
          }
--    }
+     }
 -  pFound = (Dwg_Object_Ref **)bsearch_ex (
 -      ref, dwg->object_ordered_ref, dwg->num_object_ordered_refs,
 -      sizeof (Dwg_Object_Ref *), (int (*) (const void *, const void *))Ref_cmp,
 -      (const void **)&pBefore);
 -  if (NULL == pFound)
--    {
++  newcap = ref_hash_cap (dwg->num_object_ordered_refs + 1);
++  if (!dwg->object_ordered_ref)
+     {
 -      // OK, no duplicates
 -      if (NULL != pBefore)
--        {
++      dwg->object_ordered_ref
++          = (Dwg_Object_Ref **)calloc (cap, sizeof (Dwg_Object_Ref *));
++      if (!dwg->object_ordered_ref)
+         {
 -          // Find the insertion point and insert before it
 -          size_t numCopy = dwg->num_object_ordered_refs
 -                           - (pBefore - dwg->object_ordered_ref);
 -          memmove (&pBefore[1], pBefore, sizeof (Dwg_Object_Ref *) * numCopy);
 -          *pBefore = ref;
--        }
++          dwg->num_object_ordered_refs = (BITCODE_BL)-1;
++          return;
+         }
 -      else
 -        {
 -          // The new key is the largest and attached to the last
 -          dwg->object_ordered_ref[dwg->num_object_ordered_refs] = ref;
 -        }
 -      dwg->num_object_ordered_refs++;
--    }
+     }
 -  else
--    {
++  if (newcap != cap)
+     {
 -      // There are duplicates, disable bsearch
 -      // It should never happen !
++      Dwg_Object_Ref **t
++          = (Dwg_Object_Ref **)calloc (newcap, sizeof (Dwg_Object_Ref *));
++      if (!t)
++        {
++          free (dwg->object_ordered_ref);
++          dwg->object_ordered_ref = NULL;
++          dwg->num_object_ordered_refs = (BITCODE_BL)-1;
++          return;
++        }
 +      for (size_t i = 0; i < cap; i++)
 +        if (dwg->object_ordered_ref[i])
 +          ref_hash_put (t, newcap, dwg->object_ordered_ref[i]);
@@ -817,7 +1081,20 @@
  static Dxf_Pair *
  dxf_skip_comment (Bit_Chain *dat, Dxf_Pair *pair)
  {
-@@ -1394,7 +1461,9 @@
+@@ -972,7 +1039,11 @@
+   uint32_t i = hdls->nitems;
+   if (i >= hdls->size)
+     {
+-      hdls->size += 16;
++      // UNIMOG patch: grow by half, not by 16 items. One name per entity is
++      // pushed here (its layer), and an allocator that cannot extend a block
++      // in place (Android's) copied the whole list every 16 entities:
++      // quadratic, minutes for a million lines on a phone.
++      hdls->size += hdls->size < 32 ? 16 : hdls->size / 2;
+       hdls = (array_hdls *)realloc (
+           hdls, 8 + (hdls->size * sizeof (struct array_hdl)));
+       if (!hdls)
+@@ -1394,7 +1465,9 @@
                dxf_free_pair (pair);
                return DWG_ERR_INVALIDDWG;
              }
@@ -828,7 +1105,7 @@
                && dwg->object[0].fixedtype == DWG_TYPE_BLOCK_HEADER)
              {
                Dwg_Object_BLOCK_HEADER *o
-@@ -1674,7 +1743,10 @@
+@@ -1674,7 +1747,10 @@
    // has a 0 second byte, whereas a plain UTF-8 name does not. (Keyed on the
    // actual bytes, not from_version, since a down-convert may already have
    // re-encoded the header strings to UTF-8.)
@@ -840,7 +1117,7 @@
      cp_str = cp_tmp = bit_convert_TU ((BITCODE_TU)vars->DWGCODEPAGE);
    else
      cp_str = vars->DWGCODEPAGE;
-@@ -1979,7 +2051,8 @@
+@@ -1979,7 +2055,8 @@
      }
    assert (prev >= 0 && prev <= i);
    code = pair->code - 1000; // 1000
@@ -850,7 +1127,7 @@
      {
        LOG_ERROR ("Invalid DXF code %d", pair->code);
        dwg_free_eed (obj);
-@@ -2668,7 +2741,9 @@
+@@ -2668,7 +2745,9 @@
          }
        else if (pair->code == 91)
          {
@@ -861,7 +1138,7 @@
              {
                o->vertexids
                    = (BITCODE_BL *)xcalloc (num_points, sizeof (BITCODE_BL));
-@@ -2684,9 +2759,12 @@
+@@ -2684,9 +2763,12 @@
            LOG_TRACE ("LWPOLYLINE.vertexids[%d] = %d [BL 91]\n", j,
                       pair->value.i);
          }
@@ -876,7 +1153,7 @@
              {
                o->widths = (Dwg_LWPOLYLINE_width *)xcalloc (
                    num_points, sizeof (Dwg_LWPOLYLINE_width));
-@@ -2699,16 +2777,13 @@
+@@ -2699,16 +2781,13 @@
                o->num_widths = num_points;
              }
            CHK_array (j, widths);
@@ -900,7 +1177,61 @@
          }
        else if (pair->code >= 1000 && pair->code < 1999)
          {
-@@ -7392,8 +7467,30 @@
+@@ -6949,6 +7028,7 @@
+     return pair;
+   o->num_childval = pair->value.u;
+   dxf_free_pair (pair);
++  pair = NULL; // UNIMOG patch: it was read again below after this free
+   if (o->num_childval)
+     {
+       o->childval = (Dwg_FIELD_ChildValue *)xcalloc (
+@@ -7072,9 +7152,16 @@
+         }
+       // optional 7 Key (evaluated cache); hard-coded as ACFD_FIELD_VALUE
+       pair = dxf_read_pair (dat);
+-      if (pair->code == 7)
++      // UNIMOG patch: the jump goes back into the loop above, which has
++      // ended: i is num_childval there and childval[i] is past the array
++      // (heap overflow on real DXFs with FIELD objects: results changed from
++      // run to run, sometimes a crash). The cached value is read into the
++      // last entry instead. A missing pair is no longer dereferenced.
++      if (pair && pair->code == 7)
+         {
+           dxf_free_pair (pair);
++          if (i >= o->num_childval)
++            i = o->num_childval - 1;
+           goto next_field; // one more cached field
+         }
+       else if (i + 1 == o->num_childval)
+@@ -7082,10 +7169,25 @@
+           FIELD_T (value_string, 301);
+         }
+     }
+-  if (pair->code != 301)
++  // UNIMOG patch: here `pair` is the pair read ahead after the child values
++  // (not a 7), or nothing when there were none. It was used after being
++  // freed (no children) or after FIELD_T had set it to NULL: what was read
++  // next depended on stale memory, and the same DXF gave different drawings
++  // from run to run. Now: read ahead if needed; 301 is the value string,
++  // anything else goes back to the caller.
++  if (!pair)
++    pair = dxf_read_pair (dat);
++  // a date value (type 8) is followed by its bytes (310), which are not kept
++  while (pair && pair->code == 310)
+     {
+-      FIELD_T (value_string, 301); // TODO: and 9 for subsequent >255 chunks
++      dxf_free_pair (pair);
++      pair = dxf_read_pair (dat);
+     }
++  if (!pair)
++    return NULL;
++  if (pair->code != 301)
++    return pair;
++  EXPECT_T_DXF ("value_string", 301); // TODO: and 9 for subsequent >255 chunks
+   FIELD_BL (value_string_length, 98); // ODA bug TV
+ 
+   return NULL;
+@@ -7392,8 +7494,30 @@
  find_tablehandle (Dwg_Data *restrict dwg, Dxf_Pair *restrict pair)
  {
    BITCODE_H ref = NULL;
@@ -932,7 +1263,7 @@
    else if (pair->code == 1) // $DIMBLK
      ref = dwg_find_tablehandle_silent (dwg, pair->value.s.ptr, "BLOCK");
    // some name: $DIMSTYLE, $UCSBASE, $UCSORTHOREF, $CMLSTYLE
-@@ -9859,6 +9956,11 @@
+@@ -9859,6 +9983,11 @@
        }
    }
    // more DXF defaults
@@ -944,7 +1275,7 @@
    if (obj->fixedtype == DWG_TYPE_LAYOUT)
      {
        Dwg_Object_LAYOUT *o = obj->tio.object->tio.LAYOUT;
-@@ -10164,7 +10266,15 @@
+@@ -10164,7 +10293,15 @@
                if (strEQc (obj->name, "DIMENSION_ALIGNED")
                    && strEQc (subclass, "AcDbRotatedDimension"))
                  {
@@ -960,7 +1291,7 @@
                  }
                // set the real objname
                else if (strEQc (obj->name, "POLYLINE_2D"))
-@@ -10199,6 +10309,12 @@
+@@ -10199,6 +10336,12 @@
                    if (strEQc (subclass, "AcDb3dPolylineVertex"))
                      {
                        UPGRADE_ENTITY (VERTEX_2D, VERTEX_3D)
@@ -973,7 +1304,7 @@
                      }
                    else if (strEQc (subclass, "AcDbPolyFaceMeshVertex"))
                      { // _MESH or _PFACE:
-@@ -10851,7 +10967,73 @@
+@@ -10851,9 +10994,75 @@
                    o->layout_flags = pair->value.u;
                    LOG_TRACE ("LAYOUT.layout_flags = 0x%x [BSx 70]",
                               pair->value.u);
@@ -998,7 +1329,7 @@
 +                {
 +                  UPGRADE_ENTITY (POLYLINE_2D, POLYLINE_MESH)
 +                  ((Dwg_Entity_POLYLINE_MESH *)_obj)->flag = f;
-+                }
+                 }
 +              else
 +                {
 +                  Dwg_Entity_POLYLINE_3D *o3;
@@ -1011,8 +1342,8 @@
 +                  o3->extrusion.z = 1.0;
 +                }
 +              LOG_TRACE ("R12 POLYLINE.flag %d => %s\n", f, name);
-+              break;
-+            }
+               break;
+             }
 +          else if (pair->code == 70 && !*subclass
 +                   && obj->fixedtype == DWG_TYPE_VERTEX_2D
 +                   && (pair->value.i & (32 | 64 | 128)))
@@ -1042,12 +1373,14 @@
 +                      UPGRADE_ENTITY (VERTEX_2D, VERTEX_3D)
 +                    }
 +                  ((Dwg_Entity_VERTEX_3D *)_obj)->flag = f;
-                 }
++                }
 +              LOG_TRACE ("R12 VERTEX.flag %d => %s\n", f, name);
-               break;
-             }
++              break;
++            }
            else if (pair->code == 70 && obj->fixedtype == DWG_TYPE_LWPOLYLINE)
-@@ -10903,7 +11085,8 @@
+             {
+               Dwg_Entity_LWPOLYLINE *o = obj->tio.entity->tio.LWPOLYLINE;
+@@ -10903,7 +11112,8 @@
                // subclasses is far better and more reliable), use it here to
                // upgrade the generic DIMENSION_ANG2LN (the biggest DIMENSION
                // struct, used as a placeholder until now) to its real subtype.
@@ -1057,7 +1390,7 @@
                  switch (o->flag & 31)
                    {
                    case 0: // rotated, horizontal or vertical
-@@ -11414,6 +11597,25 @@
+@@ -11414,6 +11624,25 @@
                  }
                else
                  goto search_field;
@@ -1083,7 +1416,7 @@
              }
            else if (is_textlike (obj))
              {
-@@ -12119,8 +12321,9 @@
+@@ -12119,8 +12348,9 @@
                        // which 176 of the many? the one after the previous
                        // field
                        char fieldname[40];
@@ -1095,7 +1428,7 @@
                        f = prev_vstyle + 1;
                        if (strEQc (fieldname, "display_brightness_bl_int"))
                          {
-@@ -12146,8 +12349,11 @@
+@@ -12146,8 +12376,11 @@
                              goto matching_pair;
                          }
                        else
@@ -1109,7 +1442,7 @@
                      }
                    else if (f->dxf == pair->code // matching DXF code
                             || (strEQc (f->type, "CMC") && f->size > 8
-@@ -12298,6 +12504,14 @@
+@@ -12298,6 +12531,14 @@
                            // pt.x = 0.0;
                            // if (pair->value.d == 0.0) // ignore defaults
                            //  goto next_pair;
@@ -1124,7 +1457,7 @@
                            pt.x = pair->value.d;
                            dwg_dynapi_entity_set_value (_obj, obj->name,
                                                         f->name, &pt, 1);
-@@ -12932,7 +13146,8 @@
+@@ -12932,7 +13173,8 @@
                      goto start_loop;
                  }
                else if (strEQc (name, "BLOCK")
@@ -1134,7 +1467,7 @@
                             || pair->code == 20 || pair->code == 30
                             || pair->code == 3 || pair->code == 1
                             || pair->code == 4))
-@@ -13153,6 +13368,9 @@
+@@ -13153,6 +13395,9 @@
                  {
                    BITCODE_BD ang = deg2rad (pair->value.d);
                    UPGRADE_ENTITY (DIMENSION_ALIGNED, DIMENSION_LINEAR)
@@ -1144,7 +1477,7 @@
                    dwg_dynapi_entity_set_value (_obj, "DIMENSION_LINEAR",
                                                 "oblique_angle", &ang, 1);
                    LOG_TRACE ("%s.%s = %f (from DEG %f°) [%s %d]\n", name,
-@@ -13275,10 +13493,14 @@
+@@ -13275,10 +13520,14 @@
                ctrl = &dwg->object[ctrl_id];
                if (!pair)
                  {
@@ -1161,12 +1494,10 @@
                  }
                // new_object may have reused an existing object (e.g.,
                // *Paper_Space via "Reuse existing BLOCK_HEADER"), decrementing
-@@ -13527,8 +13749,36 @@
- outofmem:
-   dxf_free_pair (pair);
+@@ -13529,6 +13778,34 @@
    return DWG_ERR_OUTOFMEM;
-+}
-+
+ }
+ 
 +/* UNIMOG patch: a broken object costs only itself. LibreDWG gave up on the
 +   whole file at the first object it could not read (an unknown group code
 +   in a FIELD, a mesh vertex, ...): 1 in 4 public drawings saved as DXF.
@@ -1176,7 +1507,7 @@
 +dxf_broken_count (void)
 +{
 +  return dxf_broken_objects;
- }
++}
 +static Dxf_Pair *
 +dxf_skip_broken (Bit_Chain *restrict dat, Dwg_Data *restrict dwg, BITCODE_BL idx)
 +{
@@ -1193,12 +1524,12 @@
 +    dxf_free_pair (pair);
 +  return pair;
 +}
- 
++
 +
  static int
  dxf_blocks_read (Bit_Chain *restrict dat, Dwg_Data *restrict dwg)
  {
-@@ -13593,10 +13843,14 @@
+@@ -13593,10 +13870,14 @@
                obj = &dwg->object[idx];
                if (!pair)
                  {
@@ -1215,7 +1546,7 @@
                  }
                if (obj->type == DWG_TYPE_BLOCK)
                  {
-@@ -13755,7 +14009,9 @@
+@@ -13755,7 +14036,9 @@
                        LOG_TRACE ("BLOCK_HEADER.endblk_entity = " FORMAT_REF
                                   " [H] (blocks)\n",
                                   ARGS_REF (_hdr->endblk_entity));
@@ -1226,7 +1557,7 @@
                          ent->entmode = 1;
                        if (_hdr->last_entity)
                          {
-@@ -13923,10 +14179,14 @@
+@@ -13923,10 +14206,14 @@
            if (!pair)
              {
                Dwg_Object *obj = &dwg->object[idx];
@@ -1243,7 +1574,42 @@
              }
            if (pair->code == 0 && pair->value.s.ptr)
              {
-@@ -14012,10 +14272,14 @@
+@@ -13940,6 +14227,7 @@
+                   obj = &dwg->object[last_ent];
+                   ent = obj->tio.entity;
+                 }
++              Dwg_Object_Ref *owner_ref = ent->ownerhandle;
+               if (ent->ownerhandle)
+                 {
+                   if (ent->ownerhandle->absolute_ref == mspace)
+@@ -13955,15 +14243,22 @@
+                       if (owner_obj && owner_obj->tio.entity)
+                         ent->entmode = owner_obj->tio.entity->entmode;
+                     }
+-                  add_to_BLOCK_HEADER (obj, ent->ownerhandle);
+                 }
+               else
+                 {
+                   ent->entmode = 2;
+-                  add_to_BLOCK_HEADER (obj, mspace_ref);
++                  owner_ref = mspace_ref;
+                 }
+-
+-              in_postprocess_handles (obj);
++              // UNIMOG streaming patch: a reader that takes the entity now
++              // (the converter: lines, arcs, text, ...) gets it before it is
++              // linked to its block header and the previous entity; it is
++              // freed then (memory stays near the file size, not 5 times it).
++              if (last_ent != dwg->num_objects - 1
++                  || !dwg_stream_offer (dwg, obj))
++                {
++                  add_to_BLOCK_HEADER (obj, owner_ref);
++                  in_postprocess_handles (obj);
++                }
+               strncpy (name, pair->value.s.ptr, 79);
+               name[79] = '\0';
+               entity_alias (name);
+@@ -14012,10 +14307,14 @@
                if (!pair)
                  {
                    Dwg_Object *obj = &dwg->object[idx];
@@ -1260,7 +1626,7 @@
                  }
              }
            else
-@@ -14187,12 +14451,117 @@
+@@ -14187,12 +14486,117 @@
      }
  }
  
@@ -1378,7 +1744,7 @@
    for (i = 0; i < obj_hdls->nitems; i++)
      {
        char *field = obj_hdls->items[i].field;
-@@ -14210,18 +14579,18 @@
+@@ -14210,18 +14614,18 @@
          }
        // TODO find field type => dxf code
        if (strEQc (field, "block_header") || strEQc (field, "block"))
@@ -1400,7 +1766,7 @@
          }
        else if (strEQc (field, "layer"))
          {
-@@ -14240,43 +14609,43 @@
+@@ -14240,43 +14644,43 @@
          {
            if (is_entity)
              p.code = 347;
@@ -1451,7 +1817,7 @@
                                               "VISUALSTYLE");
          }
        // TODO: check if DXF by name:
-@@ -14303,6 +14672,7 @@
+@@ -14303,6 +14707,7 @@
        else
          LOG_WARN ("Unknown %s.%s %s", obj->name, field, p.value.s.ptr);
      }
